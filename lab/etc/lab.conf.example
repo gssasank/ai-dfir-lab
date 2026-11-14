@@ -1,0 +1,60 @@
+; /etc/dfir-lab/lab.conf - settings for the dfir-lab toolkit.
+;
+; INI format. Lines starting with ; or # are comments; "; text" after a value
+; is a comment too. The environment variable DFIR_LAB_CONF overrides the path
+; of this file (used by the tests). Values marked REQUIRED have no default;
+; every other value shows its default.
+;
+; Nothing in the toolkit code is specific to one gateway or one case: change
+; this file, not the code.
+
+[lab]
+version = 0.1.0                      ; image/lab version shown in every report and readiness code
+course = CYBERSEC 510
+support_contact =                    ; e.g. "the TA on the course Ed board"; shown in failure messages
+
+[gateway]
+base_url =                           ; REQUIRED. Root URL without /v1, e.g. https://litellm.example.edu
+auth_style = bearer                  ; bearer | x-api-key | both  (used by dfir-lab's own checks;
+                                     ; Claude Code's apiKeyHelper value is sent in both headers)
+model_main =                         ; REQUIRED. Model ID Claude Code uses
+model_small =                        ; model ID for background tasks (default: model_main)
+connect_timeout_s = 8                ; seconds to wait for DNS / TCP / TLS
+request_timeout_s = 60               ; seconds to wait for a reply once connected
+network_hint = Connect to the Duke VPN on your host computer, then try again.
+dashboard_url =                      ; where students copy their key; named in "key rejected" messages
+
+[claude]
+binary = claude                      ; Claude Code program (name on PATH or absolute path)
+max_turns_readiness = 6              ; turn limit for readiness check 10
+readiness_timeout_s = 180            ; wall-clock limit for readiness check 10
+; Optional extra environment for Claude Code, one NAME=VALUE per indented line.
+; It is written into ~/.claude/settings.json "env" and set when dfir-lab starts
+; Claude Code. Never put the key here, and do not set ANTHROPIC_API_KEY,
+; ANTHROPIC_AUTH_TOKEN or a CLAUDE_CODE_USE_* provider selector: the toolkit
+; neutralises those and refuses a lab.conf that sets them.
+; Examples (from the Claude Code gateway docs):
+;   CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1   if the gateway rejects unknown beta fields
+;   API_TIMEOUT_MS=600000
+extra_env =
+
+[case]
+id =                                 ; REQUIRED. Short case identifier, used in file names
+title =                              ; human-readable case name (default: id)
+dir =                                ; REQUIRED. Case folder, e.g. /cases/<id>. A relative path is
+                                     ; resolved against the folder holding this file.
+manifest = MANIFEST.sha256           ; relative to dir; sha256sum format: "<hash>  <file>"
+checkpoints = checkpoints.json       ; relative to dir; built by dfir-lab-make-checkpoints
+tools_file = tools.list              ; relative to dir; one "command<TAB>version-args" per line
+replay_dir = fallback                ; relative to dir; *.jsonl recordings for dfir-lab replay
+; Optional, off by default: students fill in the worksheet outside the VM.
+; When both are set, `dfir-lab start` copies the template to the worksheet once
+; and names the worksheet in its banner.
+worksheet =                          ; relative to dir, e.g. worksheet.md
+worksheet_template =                 ; relative to dir, e.g. worksheet.template.md
+ticket = ticket.md                   ; relative to dir; incident ticket shown in the start banner
+
+[requirements]
+min_ram_mb = 5500                    ; below this: WARN
+min_free_disk_gb = 10                ; below this: FAIL
+min_cpus = 2                         ; below this: WARN

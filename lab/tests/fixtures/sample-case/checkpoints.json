@@ -1,0 +1,86 @@
+{
+  "format": 1,
+  "case": "sample-case",
+  "checkpoints": [
+    {
+      "id": 1,
+      "title": "Where did they come from?",
+      "question": "From which IP address did the remote logon come?",
+      "normalize": "ip",
+      "pattern": null,
+      "then": null,
+      "salt": "8602f88f4271b642550755639d7b3b73",
+      "hash": "dac5a3b7fd533862cb104b011dd4c1060430c795273fd49e6ffdde9099da623d",
+      "alternates": [],
+      "hints": [
+        "Look at logon events (4624 and 4625) in security-events.csv.",
+        "The same address appears in the failed attempts and in the successful logon."
+      ],
+      "success": "Right. Every attempt came from that one address."
+    },
+    {
+      "id": 2,
+      "title": "Did they get in?",
+      "question": "What is the record number of the first successful logon from that address?",
+      "normalize": "integer",
+      "pattern": null,
+      "then": null,
+      "salt": "dae560940d39c9278af052157a4c88d3",
+      "hash": "52ec887f3bb19b9ea118537e93becdb236a8db005733cc9fcce634a448f56ad4",
+      "alternates": [],
+      "hints": [
+        "Event ID 4624 is a successful logon.",
+        "It comes right after three 4625 records."
+      ],
+      "success": "Right. Three failures, then a success: a password-guessing pattern."
+    },
+    {
+      "id": 3,
+      "title": "When exactly?",
+      "question": "At what UTC time (to the second) did that successful logon happen?",
+      "normalize": "timestamp-utc-seconds",
+      "pattern": null,
+      "then": null,
+      "salt": "94297237c3ff980b55c2464140d63f75",
+      "hash": "0c31d388aab8761458c8713f5fc6da9a5fd79789c09e662ed550fc1812ee8add",
+      "alternates": [],
+      "hints": [
+        "Use the time_utc column of the record from checkpoint 2."
+      ],
+      "success": "Right. Write that time in your timeline."
+    },
+    {
+      "id": 4,
+      "title": "Which event ID?",
+      "question": "Which event ID records the installation of a new service?",
+      "normalize": "exact",
+      "pattern": null,
+      "then": null,
+      "salt": "affc1ef5e5794b6ec0e1e01fdd5a5781",
+      "hash": "2512e0640e7004f2762e93483c438ad35de7dd2a641a8f4e96a1dc1466f99dd7",
+      "alternates": [],
+      "hints": [
+        "Look in system-events.csv."
+      ],
+      "success": "Right. 7045 means a service was installed."
+    },
+    {
+      "id": 5,
+      "title": "What was left behind?",
+      "question": "What is the full path of the program the new service runs?",
+      "normalize": "regex-extract",
+      "pattern": "(?i)([a-z]:[\\\\/][^\\s\"']+\\.exe)",
+      "then": "casefold",
+      "salt": "0060aca6ca4710ec54fa6d8331ec795a",
+      "hash": "93f691fc9a1c7b48281adaf689f34a6b05be017c2d64c31dece256dbf2b6808b",
+      "alternates": [
+        "34be1c8860cc3faf7f498ce2a3af5a4cb768b20af8a7f36e5fced8ee11b44cae"
+      ],
+      "hints": [
+        "Find the 7045 record.",
+        "The image_path column holds the program path."
+      ],
+      "success": "Right. A program in a Temp folder running as a service deserves a closer look."
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Start DFIR Lab
+Comment=Open the case and start Claude Code
+Exec=@BINDIR@/dfir-lab start --pause
+Icon=utilities-terminal
+Terminal=true
+Categories=Education;

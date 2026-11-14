@@ -1,0 +1,35 @@
+# Large or sensitive material never goes into git
+evidence/
+build/
+dist/*
+# The student command downloads dist/bootstrap.sh from the tagged commit.
+!dist/bootstrap.sh
+!dist/bootstrap.sh.sha256
+*.ova
+*.vmdk
+*.E01
+*.e01
+__pycache__/
+*.pyc
+
+# Key files of any kind
+duke-api-key
+*.key
+*api-key*
+*.pem
+.env
+
+# Local runtime output from trying the toolkit
+lab/tests/fixtures/sample-case/analysis/
+lab/tests/fixtures/sample-case/reports/
+lab/tests/fixtures/sample-case/exports/
+tools/mock-gateway/*.log
+
+# Instructor-only material. This repository becomes public for the student
+# setup command, so answers, facts, reviews, and planning never go in it.
+casekit/
+reviews/
+research/
+docs/
+PLAN.md
+bootstrap/checkpoint-sources/real/

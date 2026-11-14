@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Set up Duke AI access
+Comment=Store and test your personal Duke AI key
+Exec=@BINDIR@/dfir-lab setup-key --pause
+Icon=dialog-password
+Terminal=true
+Categories=Education;

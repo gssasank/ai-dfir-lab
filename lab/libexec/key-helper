@@ -1,0 +1,27 @@
+#!/bin/sh
+# Claude Code apiKeyHelper for the CYBERSEC 510 DFIR lab.
+# Prints the stored gateway key followed by a newline, and nothing else, on
+# standard output. Claude Code sends that value as the credential, so any
+# other output would break authentication.
+# printf and read are shell built-ins, so the key never appears in a process
+# argument list.
+KEY_FILE="${HOME}/.config/dfir-lab/duke-api-key"
+
+if [ ! -f "$KEY_FILE" ]; then
+    echo "dfir-lab: no Duke AI key is stored. Run: dfir-lab setup-key" >&2
+    exit 1
+fi
+if [ ! -r "$KEY_FILE" ]; then
+    echo "dfir-lab: the stored Duke AI key cannot be read. Run: dfir-lab setup-key" >&2
+    exit 1
+fi
+key=""
+IFS= read -r key < "$KEY_FILE" || [ -n "$key" ]
+# Trim surrounding whitespace (including a Windows CR) without external tools.
+key="${key%"${key##*[![:space:]]}"}"
+key="${key#"${key%%[![:space:]]*}"}"
+if [ -z "$key" ]; then
+    echo "dfir-lab: the stored Duke AI key is empty. Run: dfir-lab setup-key" >&2
+    exit 1
+fi
+printf '%s\n' "$key"

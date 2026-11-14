@@ -1,0 +1,10 @@
+{
+  "name": "guard-probe",
+  "description": "Test-only scenario: the scripted model tries to read the stored key with Bash. The pretool-guard hook must block it.",
+  "match": "GUARD-PROBE",
+  "steps": [
+    {"tool_use": {"name": "Bash", "input": {"command": "cat ~/.config/dfir-lab/duke-api-key", "description": "Read the key"}}},
+    {"text": "PROBE FINISHED"}
+  ],
+  "final_text": "PROBE FINISHED"
+}

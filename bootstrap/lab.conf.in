@@ -1,0 +1,37 @@
+; /etc/dfir-lab/lab.conf - written by the CYBERSEC 510 lab setup script
+; (dist/bootstrap.sh, version @VERSION@). Running the setup script again
+; rewrites this file. Every setting is documented in lab/etc/lab.conf.example.
+
+[lab]
+version = @VERSION@
+course = CYBERSEC 510
+support_contact = the TA
+
+[gateway]
+base_url = @GATEWAY_BASE_URL@
+auth_style = bearer
+model_main = @MODEL_MAIN@
+model_small = @MODEL_SMALL@
+
+[claude]
+binary = @CLAUDE_BINARY@
+
+[case]
+id = @CASE_ID@
+title = @CASE_TITLE@
+dir = /cases/@CASE_ID@
+; Covers every kit file and every overlay file; written by the setup script.
+manifest = MANIFEST.lab.sha256
+checkpoints = checkpoints.json
+tools_file = tools.list
+replay_dir = fallback
+ticket = ticket.md
+; The worksheet is a document students fill in outside the VM.
+worksheet =
+worksheet_template =
+
+[requirements]
+; The SIFT OVA gives the VM 4096 MB, of which the guest sees about 3.8 GiB.
+min_ram_mb = 3500
+min_free_disk_gb = 10
+min_cpus = 2

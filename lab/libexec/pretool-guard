@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""Claude Code PreToolUse hook for the CYBERSEC 510 DFIR lab.
+
+Blocks any tool call whose input mentions the key directory, the key file
+name, the key helper, or the key itself. Fails closed: input that cannot be
+understood is denied for Bash and for unknown tools.
+
+This is a deterrent against the obvious, accidental read of the key, not a
+security boundary: Claude Code runs as the same user who owns the key, so an
+indirect shell command (a glob, a variable, a script) can still read it.
+
+Hook format verified against code.claude.com/docs/en/hooks on 2026-11-13:
+stdin JSON has tool_name and tool_input; a deny is
+{"hookSpecificOutput": {"hookEventName": "PreToolUse",
+ "permissionDecision": "deny", "permissionDecisionReason": "..."}}.
+We print that JSON *and* exit 2 (exit 2 also blocks; with both, Claude Code
+uses the JSON reason).
+
+Standard library only, no imports from the toolkit, so it starts fast.
+"""
+import json
+import os
+import sys
+
+REASON = ("Blocked by the DFIR lab: the student's Duke AI key and the files that hold it "
+          "are off limits. Do not try to read, print, copy, or locate the key, the "
+          "~/.config/dfir-lab directory, or the key helper. Continue the investigation "
+          "without them.")
+REASON_MALFORMED = ("Blocked by the DFIR lab safety check: the tool request could not be "
+                    "read, so it was refused. Try the command again in a simpler form.")
+
+# Tools whose input is inherently file- or shell-related. Malformed input for
+# these (or for a tool we cannot identify) is denied.
+FAIL_CLOSED_TOOLS = {"Bash", "BashOutput", "Monitor", "PowerShell"}
+
+
+def deny(reason):
+    out = {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                  "permissionDecision": "deny",
+                                  "permissionDecisionReason": reason}}
+    sys.stdout.write(json.dumps(out) + "\n")
+    sys.stdout.flush()
+    sys.stderr.write(reason + "\n")
+    sys.exit(2)
+
+
+def allow():
+    sys.exit(0)
+
+
+def stored_key():
+    path = os.path.join(os.path.expanduser("~"), ".config", "dfir-lab", "duke-api-key")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def needles():
+    home = os.path.expanduser("~")
+    here = os.path.dirname(os.path.abspath(__file__))
+    out = [
+        ".config/dfir-lab",
+        "config/dfir-lab",
+        "duke-api-key",
+        "key-helper",
+        os.path.join(home, ".config", "dfir-lab").lower(),
+        os.path.join(here, "key-helper").lower(),
+    ]
+    return out
+
+
+def strings(obj):
+    """Every string inside the tool input (keys and values)."""
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            yield str(k)
+            yield from strings(v)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            yield from strings(v)
+    elif obj is not None:
+        yield str(obj)
+
+
+def squash(s):
+    return "".join(s.split())
+
+
+def main():
+    try:
+        raw = sys.stdin.read()
+    except Exception:  # noqa: BLE001
+        deny(REASON_MALFORMED)
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        deny(REASON_MALFORMED)
+    if not isinstance(data, dict):
+        deny(REASON_MALFORMED)
+    tool = data.get("tool_name")
+    tool_input = data.get("tool_input")
+    if not isinstance(tool, str) or not tool:
+        deny(REASON_MALFORMED)
+    if tool_input is None or not isinstance(tool_input, (dict, list, str)):
+        if tool in FAIL_CLOSED_TOOLS:
+            deny(REASON_MALFORMED)
+        allow()
+    if tool in FAIL_CLOSED_TOOLS and isinstance(tool_input, dict):
+        cmd = tool_input.get("command")
+        if tool == "Bash" and not isinstance(cmd, str):
+            deny(REASON_MALFORMED)
+
+    texts = list(strings(tool_input))
+    blob = "\n".join(texts)
+    low = blob.lower()
+    # Normalise shell escapes and quotes a little: c"o"nfig, conf\ig.
+    low_plain = low.replace("\\", "").replace('"', "").replace("'", "")
+    for n in needles():
+        if n in low or n in low_plain:
+            deny(REASON)
+    key = stored_key()
+    if key and len(key) >= 4:
+        if key in blob or squash(key) in squash(blob):
+            deny(REASON)
+    allow()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:  # noqa: BLE001 - fail closed on any internal error
+        deny(REASON_MALFORMED)

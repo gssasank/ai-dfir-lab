@@ -1,0 +1,31 @@
+{
+  "apiKeyHelper": "@LIBEXEC@/key-helper",
+  "env": {
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "DISABLE_AUTOUPDATER": "1"
+  },
+  "permissions": {
+    "deny": [
+      "Read(~/.config/dfir-lab/**)",
+      "Read(~/.config/dfir-lab)",
+      "Edit(~/.config/dfir-lab/**)",
+      "WebFetch",
+      "WebSearch"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "@LIBEXEC@/pretool-guard",
+            "timeout": 10,
+            "onFailure": "block"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,3 @@
+DFIR lab readiness sample file.
+The readiness check copies this folder to a temporary place, adds a random
+line below, asks Claude Code to run readiness.sh, and compares the result.

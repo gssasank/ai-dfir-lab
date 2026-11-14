@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Offline replay
+Comment=Step through a recorded session without the gateway
+Exec=@BINDIR@/dfir-lab replay --pause
+Icon=media-playback-start
+Terminal=true
+Categories=Education;

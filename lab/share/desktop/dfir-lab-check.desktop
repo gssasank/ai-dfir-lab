@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Check my setup
+Comment=Run the readiness check and get your readiness code
+Exec=@BINDIR@/dfir-lab check --pause
+Icon=system-run
+Terminal=true
+Categories=Education;

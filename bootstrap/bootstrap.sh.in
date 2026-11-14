@@ -1,0 +1,1158 @@
+#!/usr/bin/env bash
+# CYBERSEC 510 DFIR lab setup script.
+#
+# Turns an untouched SANS SIFT Workstation VM into a ready lab machine:
+# Claude Code (pinned version), Protocol SIFT, the dfir-lab toolkit, the case
+# files, and a few desktop settings. Safe to run any number of times.
+#
+#   bash bootstrap.sh [--yes] [--kit PATH]
+#   bash bootstrap.sh --uninstall [--purge] [--yes]
+#
+# GENERATED FILE: dist/bootstrap.sh is built by bootstrap/build.py from
+# bootstrap/bootstrap.sh.in, bootstrap/release.conf, the toolkit in lab/ and
+# bootstrap/case-overlay/. The compressed payload at the end of the file holds
+# the toolkit and the case overlay. Edit the sources, not this file.
+#
+# Exit codes: 0 setup complete; 1 setup incomplete (the summary says why and
+# what to do; running again resumes); 2 refused (usage, run as root, not
+# confirmed); 3 stopped by an error.
+
+set -u -o pipefail
+umask 022
+
+# ---- release settings (filled in by build.py) ------------------------------
+@@RELEASE_SETTINGS@@
+# -----------------------------------------------------------------------------
+
+PAYLOAD_MARKER="__DFIR_LAB_PAYLOAD""_BELOW__"
+CASE_DIR="/cases/$R_CASE_ID"
+STATE_DIR="$HOME/dfir-lab"
+LOG_DIR="$STATE_DIR/logs"
+CLAUDE_BIN="$HOME/.local/bin/claude"
+PSIFT_MARKER="$HOME/.claude/.protocol-sift-install"
+TOOLKIT_STAMP="/usr/local/lib/dfir-lab/.setup-stamp"
+SHORTCUTS="dfir-lab-setup-key dfir-lab-start dfir-lab-check dfir-lab-replay"
+STUDENT_DIRS="analysis reports exports .claude"
+BROWSER_DESKTOP="chromium_chromium.desktop"
+BASHRC_BEGIN="# >>> dfir-lab setup (CYBERSEC 510) >>>"
+BASHRC_END="# <<< dfir-lab setup (CYBERSEC 510) <<<"
+TOTAL_STEPS=8
+MIN_FREE_GB=3
+
+SELF=""
+LOG=""
+WORK=""
+PAYLOAD=""
+YES=0
+KIT_ARG=""
+MODE="setup"
+PURGE=0
+CHANGED=0
+CLAUDE_OK=0
+PSIFT_OK=0
+TOOLKIT_OK=0
+CASE_OK=0
+CLAUDE_FOUND=""
+INCOMPLETE=()
+WARNINGS=()
+NOTES=()
+STEP_START=0
+STEP_RX=0
+
+# ---------------------------------------------------------------------------
+# Output. The screen gets one line per step plus short results; the log gets
+# everything, including the full output of every command.
+# ---------------------------------------------------------------------------
+
+out() {
+    printf '%s\n' "$*"
+    if [ -n "$LOG" ]; then printf '%s\n' "$*" >> "$LOG"; fi
+}
+log() { if [ -n "$LOG" ]; then printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >> "$LOG"; fi; }
+ok()   { out "      ok: $*"; }
+done_already() { out "      already done: $*"; }
+warn() { out "      WARNING: $*"; WARNINGS+=("$*"); }
+note() { out "      note: $*"; }
+
+# incomplete "what is not done" "what the student should do"
+incomplete() {
+    out "      NOT DONE: $1"
+    INCOMPLETE+=("$1|$2")
+}
+
+# Run a command with all its output going to the log only.
+run() {
+    log "+ $*"
+    "$@" >> "$LOG" 2>&1 < /dev/null
+    local rc=$?
+    [ "$rc" -eq 0 ] || log "  (exit code $rc)"
+    return "$rc"
+}
+
+changed() { CHANGED=$((CHANGED + 1)); }
+
+rx_bytes() {
+    local total=0 f n
+    for f in /sys/class/net/*/statistics/rx_bytes; do
+        case "$f" in */lo/*|*/docker*|*/veth*|*/br-*) continue ;; esac
+        read -r n < "$f" 2>/dev/null || continue
+        total=$((total + n))
+    done
+    echo "$total"
+}
+
+step() {
+    end_step
+    out "[$1/$TOTAL_STEPS] $2"
+    log "---- step $1: $2"
+    STEP_START=$SECONDS
+    STEP_RX=$(rx_bytes)
+    STEP_ACTIVE=1
+}
+STEP_ACTIVE=0
+end_step() {
+    if [ "$STEP_ACTIVE" -eq 1 ]; then
+        local mb=$(( ($(rx_bytes) - STEP_RX) / 1048576 ))
+        log "---- step took $((SECONDS - STEP_START)) s, network received about $mb MB"
+    fi
+    STEP_ACTIVE=0
+}
+
+die() {  # stop with an error (exit 3)
+    out ""
+    out "SETUP STOPPED: $1"
+    [ -n "${2:-}" ] && out "What to do: $2"
+    [ -n "$LOG" ] && out "Log: $LOG"
+    exit 3
+}
+
+cleanup() {
+    if [ -n "$WORK" ] && [ -d "$WORK" ]; then rm -rf "$WORK" 2>/dev/null; fi
+    sudo -n rm -rf "/cases/.$R_CASE_ID.staging" "/cases/.$R_CASE_ID.unzip" \
+        "/cases/.$R_CASE_ID.old" 2>/dev/null || true
+}
+
+on_interrupt() {
+    out ""
+    out "Setup interrupted. Nothing is broken: run the same command again to continue."
+    [ -n "$LOG" ] && out "Log: $LOG"
+    exit 130
+}
+
+usage() {
+    cat <<EOF
+CYBERSEC 510 DFIR lab setup, version $R_VERSION
+
+  bash bootstrap.sh [--yes] [--kit PATH]
+  bash bootstrap.sh --uninstall [--purge] [--yes]
+
+  --kit PATH    use this case kit zip (default: look for $R_CASE_KIT_PATTERN
+                in ~/Downloads, ~/Desktop and your home folder)
+  --yes         answer yes to questions (for automation)
+  --uninstall   remove the lab toolkit, the case folder and the .bashrc
+                change; keep Claude Code, Protocol SIFT, your Duke AI key and
+                your work (analysis/, reports/, exports/)
+  --purge       with --uninstall: also remove Claude Code, ~/.claude
+                (Protocol SIFT), your Duke AI key, ~/dfir-lab and your work
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Start-up
+# ---------------------------------------------------------------------------
+
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --yes|-y) YES=1; shift ;;
+            --kit) [ $# -ge 2 ] || { echo "--kit needs a file name" >&2; exit 2; }
+                   KIT_ARG=$2; shift 2 ;;
+            --kit=*) KIT_ARG=${1#--kit=}; shift ;;
+            --uninstall) MODE="uninstall"; shift ;;
+            --purge) PURGE=1; shift ;;
+            --version) echo "$R_VERSION"; exit 0 ;;
+            -h|--help) usage; exit 0 ;;
+            *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+        esac
+    done
+    if [ "$PURGE" -eq 1 ] && [ "$MODE" != "uninstall" ]; then
+        echo "--purge only works together with --uninstall" >&2; exit 2
+    fi
+    if [ -n "$KIT_ARG" ]; then
+        case "$KIT_ARG" in /*) ;; *) KIT_ARG="$PWD/$KIT_ARG" ;; esac
+    fi
+}
+
+refuse_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        echo "Please do not run this with sudo or as root."
+        echo "Run it as yourself (the sansforensics user); it asks for administrator"
+        echo "rights itself where it needs them:"
+        echo "    bash bootstrap.sh"
+        exit 2
+    fi
+}
+
+start_log() {
+    # --purge deletes ~/dfir-lab, so its log goes to /tmp.
+    if [ "$MODE" = "uninstall" ] && [ "$PURGE" -eq 1 ]; then LOG_DIR=/tmp; fi
+    mkdir -p "$LOG_DIR" "$STATE_DIR" 2>/dev/null || { echo "Cannot create $LOG_DIR"; exit 3; }
+    LOG="$LOG_DIR/bootstrap-$(date -u +%Y%m%dT%H%M%SZ).log"
+    : > "$LOG" || { echo "Cannot write the log $LOG"; exit 3; }
+    # Anything bash itself complains about also lands in the log.
+    exec 2> >(tee -a "$LOG" >&2)
+    log "bootstrap.sh $R_VERSION ($MODE) started by $(id -un) on $(hostname) in $PWD"
+    log "script: $SELF"
+    log "release: claude=$R_CLAUDE_CODE_VERSION protocol-sift=$R_PROTOCOL_SIFT_COMMIT case=$R_CASE_ID gateway=$R_GATEWAY_BASE_URL"
+}
+
+take_lock() {
+    exec 9> "$STATE_DIR/.setup.lock"
+    if ! flock -n 9; then
+        out "Another copy of the lab setup is already running. Wait for it to finish."
+        exit 2
+    fi
+}
+
+extract_payload() {
+    WORK=$(mktemp -d /tmp/dfir-lab-setup.XXXXXXXX) || die "cannot create a temporary folder"
+    local line
+    line=$(grep -n -m1 -x -F "$PAYLOAD_MARKER" "$SELF" | cut -d: -f1)
+    [ -n "$line" ] || die "this copy of bootstrap.sh is incomplete." \
+        "Download it again with the command from the course page."
+    if ! tail -n +"$((line + 1))" "$SELF" | base64 -d > "$WORK/payload.tgz" 2>> "$LOG"; then
+        die "this copy of bootstrap.sh is damaged." "Download it again with the command from the course page."
+    fi
+    local sum
+    sum=$(sha256sum < "$WORK/payload.tgz" | cut -c1-64)
+    if [ "$sum" != "$R_PAYLOAD_SHA256" ]; then
+        die "this copy of bootstrap.sh is damaged (its contents do not match)." \
+            "Download it again with the command from the course page."
+    fi
+    tar -xzf "$WORK/payload.tgz" -C "$WORK" 2>> "$LOG" || die "could not unpack bootstrap.sh."
+    PAYLOAD="$WORK/payload"
+    log "payload unpacked to $PAYLOAD (sha256 $sum)"
+}
+
+session_env() {
+    # Desktop settings need the student's desktop session (D-Bus). A terminal
+    # on the desktop has it; supply it when started some other way.
+    local uid
+    uid=$(id -u)
+    [ -n "${XDG_RUNTIME_DIR:-}" ] || export XDG_RUNTIME_DIR="/run/user/$uid"
+    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "$XDG_RUNTIME_DIR/bus" ]; then
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+    fi
+    # Without the session's XDG_DATA_DIRS, GIO does not see snap applications
+    # such as Chromium (/var/lib/snapd/desktop).
+    if [ -z "${XDG_DATA_DIRS:-}" ]; then
+        export XDG_DATA_DIRS="/usr/share/ubuntu:/usr/share/gnome:/usr/local/share/:/usr/share/:/var/lib/snapd/desktop"
+    fi
+    [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "$XDG_RUNTIME_DIR/bus" ]
+}
+
+# ---------------------------------------------------------------------------
+# Step 1: preflight
+# ---------------------------------------------------------------------------
+
+preflight() {
+    step 1 "Checking this computer"
+    local problems=() user os_id="" os_ver="" arch
+    user=$(id -un)
+    arch=$(uname -m)
+    if [ -r /etc/os-release ]; then
+        os_id=$(. /etc/os-release && echo "${ID:-}")
+        os_ver=$(. /etc/os-release && echo "${VERSION_ID:-}")
+    fi
+    [ "$user" = "sansforensics" ] || problems+=("you are logged in as '$user', not 'sansforensics'")
+    [ "$os_id" = "ubuntu" ] && [ "$os_ver" = "24.04" ] || \
+        problems+=("the system is '${os_id:-unknown} ${os_ver:-}', not Ubuntu 24.04")
+    [ "$arch" = "x86_64" ] || problems+=("the processor type is '$arch', not x86-64")
+    log "user=$user os=$os_id $os_ver arch=$arch"
+    if [ ${#problems[@]} -gt 0 ]; then
+        out "      This does not look like the SANS SIFT Workstation VM the lab is made for:"
+        local p
+        for p in "${problems[@]}"; do out "        - $p"; done
+        if [ "$YES" -eq 1 ]; then
+            warn "continuing anyway because --yes was given"
+        elif [ -t 0 ]; then
+            local ans=""
+            read -r -p "      Continue anyway? [y/N] " ans
+            log "answer: $ans"
+            case "$ans" in [Yy]*) warn "continuing on a VM that is not the expected SIFT VM" ;;
+                *) out "      Stopped. Nothing was changed."; exit 2 ;; esac
+        else
+            out "      Stopped. Nothing was changed. (Add --yes to continue anyway.)"
+            exit 2
+        fi
+    fi
+
+    # Administrator rights (no password on the SIFT VM).
+    if ! sudo -n true 2>/dev/null; then
+        if [ -t 0 ]; then
+            out "      This setup needs administrator rights. Enter your password if asked."
+            sudo -v || die "administrator rights are needed." "Run the command again and enter your password."
+        else
+            die "administrator rights are needed and sudo asks for a password." \
+                "Run the command in a terminal on the VM desktop."
+        fi
+    fi
+
+    # Disk space.
+    local free_kb free_gb
+    free_kb=$(df -Pk / | awk 'NR==2 {print $4}')
+    free_gb=$((free_kb / 1048576))
+    log "free space on /: $free_gb GB"
+    if [ "$free_gb" -lt "$MIN_FREE_GB" ]; then
+        die "only $free_gb GB of disk space is free; the setup needs at least $MIN_FREE_GB GB." \
+            "Delete large files you do not need, then run the command again."
+    fi
+
+    # Network: the hosts the setup downloads from. A failure is reported here
+    # and again by the step that needs the host.
+    local h code unreachable=()
+    for h in claude.ai downloads.claude.ai github.com; do
+        code=$(curl -s -o /dev/null -I --connect-timeout 8 -m 15 -w '%{http_code}' "https://$h/" 2>/dev/null)
+        log "network probe https://$h/ -> HTTP ${code:-000}"
+        [ "${code:-000}" != "000" ] || unreachable+=("$h")
+    done
+    if [ ${#unreachable[@]} -gt 0 ]; then
+        warn "cannot reach ${unreachable[*]}; downloads will fail. Check that the VM has internet (VMware network: NAT)."
+    fi
+    out "      passed: SIFT VM (${os_id:-?} ${os_ver:-?}, $arch, user $user), $free_gb GB free$([ ${#unreachable[@]} -eq 0 ] && echo ', internet reachable')"
+}
+
+# ---------------------------------------------------------------------------
+# Step 2: system packages
+# ---------------------------------------------------------------------------
+
+wait_apt_lock() {
+    local waited=0
+    while sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock \
+            /var/cache/apt/archives/lock > /dev/null 2>&1; do
+        [ "$waited" -eq 0 ] && out "      waiting for another software update on this VM to finish..."
+        sleep 5
+        waited=$((waited + 5))
+        [ "$waited" -ge 600 ] && return 1
+    done
+    return 0
+}
+
+packages() {
+    step 2 "Installing missing system packages (copy and paste support)"
+    local need=()
+    dpkg-query -W -f='${Status}' open-vm-tools-desktop 2>/dev/null | grep -q "install ok installed" \
+        || need+=(open-vm-tools-desktop)
+    command -v zenity > /dev/null 2>&1 || need+=(zenity)
+    if [ ${#need[@]} -eq 0 ]; then
+        done_already "open-vm-tools-desktop and zenity are installed"
+        return
+    fi
+    log "missing packages: ${need[*]}"
+    if ! wait_apt_lock; then
+        warn "another software update kept running for 10 minutes; skipped ${need[*]}"
+        return
+    fi
+    if ! run sudo env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 update; then
+        warn "could not refresh the package lists (apt-get update failed); trying anyway"
+    fi
+    local p
+    for p in "${need[@]}"; do
+        if run sudo env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 \
+                install -y --no-install-recommends "$p"; then
+            changed
+            if [ "$p" = "open-vm-tools-desktop" ]; then
+                ok "installed open-vm-tools-desktop (copy and paste works after the VM restarts)"
+                NOTES+=("Copy and paste between your computer and the VM starts working after you restart the VM.")
+            else
+                ok "installed $p"
+            fi
+        else
+            if [ "$p" = "open-vm-tools-desktop" ]; then
+                warn "could not install open-vm-tools-desktop: copy and paste between your computer and the VM will not work"
+            else
+                warn "could not install $p: the lab tools will ask questions in the terminal instead of in windows"
+            fi
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Step 3: Claude Code
+# ---------------------------------------------------------------------------
+
+claude_version() {  # prints X.Y.Z of the claude at $1, or nothing
+    [ -x "$1" ] || return 0
+    timeout 60 "$1" --version < /dev/null 2>/dev/null | head -n1 | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' || true
+}
+
+claude_code() {
+    step 3 "Installing Claude Code $R_CLAUDE_CODE_VERSION"
+    local cur
+    cur=$(claude_version "$CLAUDE_BIN")
+    log "installed Claude Code at $CLAUDE_BIN: ${cur:-none}"
+    if [ "$cur" = "$R_CLAUDE_CODE_VERSION" ]; then
+        done_already "Claude Code $cur is installed ($CLAUDE_BIN)"
+        CLAUDE_OK=1; CLAUDE_FOUND=$cur
+        return
+    fi
+    [ -n "$cur" ] && out "      replacing Claude Code $cur with $R_CLAUDE_CODE_VERSION"
+    local inst="$WORK/claude-install.sh"
+    if ! run curl -fsSL --retry 3 --connect-timeout 15 -o "$inst" https://claude.ai/install.sh; then
+        incomplete "Claude Code could not be downloaded." \
+            "Check that the VM has internet, then run the same setup command again."
+        return
+    fi
+    out "      downloading and installing (about 250 MB; this is the slowest step)..."
+    run env DISABLE_AUTOUPDATER=1 bash "$inst" "$R_CLAUDE_CODE_VERSION"
+    cur=$(claude_version "$CLAUDE_BIN")
+    if [ "$cur" != "$R_CLAUDE_CODE_VERSION" ] && [ -x "$CLAUDE_BIN" ]; then
+        log "version after the installer: ${cur:-none}; forcing $R_CLAUDE_CODE_VERSION"
+        run env DISABLE_AUTOUPDATER=1 "$CLAUDE_BIN" install --force "$R_CLAUDE_CODE_VERSION"
+        cur=$(claude_version "$CLAUDE_BIN")
+    fi
+    log "Claude Code now: ${cur:-none} -> $(readlink -f "$CLAUDE_BIN" 2>/dev/null)"
+    if [ "$cur" = "$R_CLAUDE_CODE_VERSION" ]; then
+        ok "Claude Code $cur installed ($CLAUDE_BIN)"
+        CLAUDE_OK=1; CLAUDE_FOUND=$cur
+        changed
+    else
+        incomplete "Claude Code $R_CLAUDE_CODE_VERSION could not be installed (found: ${cur:-nothing})." \
+            "Check that the VM has internet, then run the same setup command again."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Step 4: Protocol SIFT
+# ---------------------------------------------------------------------------
+
+psift_installed() {
+    [ -f "$PSIFT_MARKER" ] || return 1
+    [ "$(head -n1 "$PSIFT_MARKER")" = "commit=$R_PROTOCOL_SIFT_COMMIT" ] || return 1
+    (cd "$HOME/.claude" && tail -n +2 "$PSIFT_MARKER" | sha256sum -c --status --strict) 2>/dev/null
+}
+
+protocol_sift() {
+    step 4 "Installing Protocol SIFT (forensic instructions for Claude Code)"
+    local short=${R_PROTOCOL_SIFT_COMMIT:0:7}
+    if psift_installed; then
+        done_already "Protocol SIFT $short is installed in ~/.claude"
+        PSIFT_OK=1
+        return
+    fi
+    if [ "$CLAUDE_OK" -ne 1 ]; then
+        # Its installer would otherwise install an unpinned Claude Code.
+        incomplete "Protocol SIFT was not installed because Claude Code is missing." \
+            "Run the same setup command again."
+        return
+    fi
+    local dir="$WORK/protocol-sift" head
+    if ! run git clone --quiet --no-checkout "$R_PROTOCOL_SIFT_REPO" "$dir" || \
+       ! run git -C "$dir" -c advice.detachedHead=false checkout --quiet "$R_PROTOCOL_SIFT_COMMIT"; then
+        incomplete "Protocol SIFT could not be downloaded from GitHub." \
+            "Check that the VM has internet, then run the same setup command again."
+        return
+    fi
+    head=$(git -C "$dir" rev-parse HEAD 2>/dev/null)
+    if [ "$head" != "$R_PROTOCOL_SIFT_COMMIT" ]; then
+        incomplete "the Protocol SIFT download is not the expected version ($head)." \
+            "Run the same setup command again; if it happens again, tell the TA."
+        return
+    fi
+    log "Protocol SIFT checked out at $head"
+    # Its installer finds Claude Code on PATH (ours), copies its files into
+    # ~/.claude and replaces ~/.claude/settings.json; the toolkit step after
+    # this one merges the course settings back in.
+    if ! run env PATH="$HOME/.local/bin:$PATH" bash "$dir/install.sh"; then
+        incomplete "the Protocol SIFT installer failed." \
+            "Run the same setup command again; if it happens again, tell the TA and send the log."
+        return
+    fi
+    local files=("CLAUDE.md") s missing=0
+    cmp -s "$dir/global/CLAUDE.md" "$HOME/.claude/CLAUDE.md" || missing=1
+    for s in "$dir"/skills/*/SKILL.md; do
+        s=${s#"$dir/"}
+        files+=("$s")
+        cmp -s "$dir/$s" "$HOME/.claude/$s" || missing=1
+    done
+    if [ "$missing" -ne 0 ]; then
+        incomplete "Protocol SIFT's files were not all installed in ~/.claude." \
+            "Run the same setup command again; if it happens again, tell the TA and send the log."
+        return
+    fi
+    { echo "commit=$R_PROTOCOL_SIFT_COMMIT"
+      (cd "$HOME/.claude" && sha256sum -- "${files[@]}"); } > "$PSIFT_MARKER.tmp" \
+        && mv "$PSIFT_MARKER.tmp" "$PSIFT_MARKER"
+    ok "Protocol SIFT $short installed in ~/.claude (global CLAUDE.md and $(( ${#files[@]} - 1 )) skills)"
+    PSIFT_OK=1
+    changed
+}
+
+# ---------------------------------------------------------------------------
+# Step 5: lab toolkit
+# ---------------------------------------------------------------------------
+
+toolkit_current() {  # $1 = generated lab.conf, $2 = stamp
+    sudo test -f "$TOOLKIT_STAMP" || return 1
+    [ "$(sudo cat "$TOOLKIT_STAMP" 2>/dev/null)" = "$2" ] || return 1
+    cmp -s "$1" /etc/dfir-lab/lab.conf || return 1
+    [ -x /usr/local/bin/dfir-lab ] && [ -x /usr/local/bin/dfir-lab-configure-claude ] || return 1
+    local s
+    for s in $SHORTCUTS; do
+        [ -x "$HOME/Desktop/$s.desktop" ] || return 1
+        cmp -s "$HOME/Desktop/$s.desktop" "/usr/local/share/applications/$s.desktop" || return 1
+    done
+    return 0
+}
+
+toolkit() {
+    step 5 "Installing the lab toolkit (dfir-lab)"
+    local conf="$WORK/lab.conf" stamp
+    sed "s#@CLAUDE_BINARY@#$CLAUDE_BIN#" "$PAYLOAD/lab.conf.in" > "$conf"
+    stamp="$R_PAYLOAD_SHA256 $(sha256sum < "$conf" | cut -c1-64)"
+    local fresh=0
+    if toolkit_current "$conf" "$stamp"; then
+        done_already "dfir-lab $R_VERSION is installed (commands, desktop shortcuts, settings)"
+    else
+        if ! run sudo sh "$PAYLOAD/lab/install.sh" --user "$(id -un)" --conf "$conf"; then
+            incomplete "the lab toolkit could not be installed." \
+                "Run the same setup command again; if it happens again, tell the TA and send the log."
+            return
+        fi
+        printf '%s\n' "$stamp" | sudo tee "$TOOLKIT_STAMP" > /dev/null
+        ok "dfir-lab $R_VERSION installed (commands, desktop shortcuts, Claude Code settings)"
+        changed
+        fresh=1
+    fi
+    # Merge the course settings into ~/.claude/settings.json. This changes
+    # nothing when they are already there (for example on a second run), and
+    # puts them back when something (such as Protocol SIFT) replaced the file.
+    local merged
+    merged=$(dfir-lab-configure-claude 2>&1 < /dev/null)
+    local rc=$?
+    log "dfir-lab-configure-claude (exit $rc):"
+    printf '%s\n' "$merged" >> "$LOG"
+    if [ "$rc" -ne 0 ]; then
+        incomplete "the course settings could not be written into Claude Code's settings file." \
+            "Tell the TA and send the log."
+        return
+    fi
+    case "$merged" in
+        *"Updated Claude Code settings"*) ok "added the course settings to ~/.claude/settings.json (kept Protocol SIFT's)"; changed ;;
+        *) [ "$fresh" -eq 1 ] || done_already "the course settings are in ~/.claude/settings.json" ;;
+    esac
+    TOOLKIT_OK=1
+}
+
+# ---------------------------------------------------------------------------
+# Step 6: case kit
+# ---------------------------------------------------------------------------
+
+kit_hash_accepted() {
+    case " $R_CASE_KIT_SHA256 " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+
+# Sorts "hash  path" lines by path.
+sort_sums() { awk '{ print substr($0, 67) "\t" $0 }' | LC_ALL=C sort | cut -f2-; }
+
+# Writes MANIFEST.lab.sha256 in directory $1 from .dfir-lab/kit.sha256 and
+# .dfir-lab/overlay.sha256 (overlay files replace kit files of the same name).
+compose_manifest() {
+    local d=$1
+    { sudo awk 'NR == FNR { ov[substr($0, 67)] = 1; next } !(substr($0, 67) in ov)' \
+          "$d/.dfir-lab/overlay.sha256" "$d/.dfir-lab/kit.sha256" &&
+      sudo cat "$d/.dfir-lab/overlay.sha256"; } | sort_sums \
+        | sudo tee "$d/MANIFEST.lab.sha256.new" > /dev/null &&
+        sudo mv "$d/MANIFEST.lab.sha256.new" "$d/MANIFEST.lab.sha256"
+}
+
+# Root owns everything from the kit and the overlay (the student can read but
+# not change it); the student owns the working folders and what is in them.
+fix_case_permissions() {
+    local d=$1 u g s
+    u=$(id -un); g=$(id -gn)
+    local prune=()
+    for s in $STUDENT_DIRS; do prune+=(! -name "$s"); done
+    run sudo find "$d" -mindepth 1 -maxdepth 1 "${prune[@]}" -exec chown -R root:root {} + || return 1
+    run sudo find "$d" -mindepth 1 -maxdepth 1 "${prune[@]}" -exec chmod -R u+rwX,go+rX,go-w {} + || return 1
+    run sudo chown root:root "$d" && run sudo chmod 755 "$d" || return 1
+    for s in $STUDENT_DIRS; do
+        sudo mkdir -p "$d/$s" && run sudo chown "$u:$g" "$d/$s" && run sudo chmod 755 "$d/$s" || return 1
+    done
+}
+
+# Verifies an installed case folder. Returns 0 when it is complete and right.
+case_verified() {
+    [ -d "$CASE_DIR/.dfir-lab" ] || { log "case: no installed case folder"; return 1; }
+    local zipsum
+    zipsum=$(cut -c1-64 "$CASE_DIR/.dfir-lab/kit-zip.sha256" 2>/dev/null)
+    kit_hash_accepted "$zipsum" || { log "case: installed kit $zipsum is not an accepted kit"; return 1; }
+    if [ -n "$KIT_FOUND_SHA" ] && [ "$KIT_FOUND_SHA" != "$zipsum" ] && [ -n "$KIT_ARG" ]; then
+        log "case: --kit names a different accepted kit"; return 1
+    fi
+    (cd "$CASE_DIR" && sha256sum -c --status --strict .dfir-lab/kit.sha256) 2>/dev/null \
+        || { log "case: kit files changed or missing"; return 1; }
+    if ! cmp -s "$CASE_DIR/.dfir-lab/overlay.sha256" "$PAYLOAD/overlay.sha256" || \
+       ! (cd "$CASE_DIR" && sha256sum -c --status --strict .dfir-lab/overlay.sha256) 2>/dev/null; then
+        log "case: overlay differs from this version"
+        return 2
+    fi
+    (cd "$CASE_DIR" && sha256sum -c --status --strict MANIFEST.lab.sha256) 2>/dev/null \
+        || { log "case: MANIFEST.lab.sha256 does not verify"; return 1; }
+    # Nothing outside the working folders may be writable by the student.
+    local w
+    w=$(find "$CASE_DIR" \( -path "$CASE_DIR/analysis" -o -path "$CASE_DIR/reports" -o \
+            -path "$CASE_DIR/exports" -o -path "$CASE_DIR/.claude" \) -prune -o -writable -print 2>/dev/null | head -n 3)
+    [ -z "$w" ] || { log "case: writable by the student: $w"; return 1; }
+    local s
+    for s in $STUDENT_DIRS; do
+        [ -d "$CASE_DIR/$s" ] && [ -w "$CASE_DIR/$s" ] || { log "case: $s missing or not writable"; return 1; }
+    done
+    return 0
+}
+
+update_overlay() {  # kit verified, overlay differs: replace the overlay files only
+    local d=$CASE_DIR p
+    log "updating the case overlay in $d"
+    while read -r _ p; do
+        case "$p" in ""|/*|*..*) continue ;; esac
+        sudo rm -f -- "$d/$p"
+    done < "$d/.dfir-lab/overlay.sha256"
+    run sudo cp -R "$PAYLOAD/case-overlay/." "$d/" || return 1
+    run sudo cp "$PAYLOAD/overlay.sha256" "$d/.dfir-lab/overlay.sha256" || return 1
+    compose_manifest "$d" || return 1
+    fix_case_permissions "$d" || return 1
+}
+
+KIT_FOUND=""
+KIT_FOUND_SHA=""
+KIT_REJECTED=()
+
+find_kit() {
+    local candidates=() f d sum newest=0 m
+    if [ -n "$KIT_ARG" ]; then
+        [ -f "$KIT_ARG" ] && candidates+=("$KIT_ARG")
+    else
+        local old
+        old=$(shopt -p nullglob); shopt -s nullglob
+        for d in "$HOME/Downloads" "$HOME/Desktop" "$HOME"; do
+            for f in "$d"/$R_CASE_KIT_PATTERN; do [ -f "$f" ] && candidates+=("$f"); done
+        done
+        eval "$old"
+    fi
+    for f in "${candidates[@]}"; do
+        out "      checking $f ..."
+        sum=$(sha256sum -- "$f" | cut -c1-64)
+        log "kit candidate $f sha256=$sum"
+        if kit_hash_accepted "$sum"; then
+            m=$(stat -c %Y -- "$f")
+            if [ "$m" -ge "$newest" ]; then newest=$m; KIT_FOUND=$f; KIT_FOUND_SHA=$sum; fi
+        else
+            KIT_REJECTED+=("$f")
+        fi
+    done
+}
+
+validate_kit_zip() {  # $1 = zip; prints the top-level directory name
+    local z=$1 list top
+    list=$(unzip -Z1 "$z" 2>> "$LOG") || { log "kit: not a readable zip"; return 1; }
+    if printf '%s\n' "$list" | grep -qE '(^/|(^|/)\.\.(/|$)|\\)'; then
+        log "kit: unsafe path in zip"; return 1
+    fi
+    top=$(printf '%s\n' "$list" | cut -d/ -f1 | sort -u)
+    if [ "$(printf '%s\n' "$top" | wc -l)" -ne 1 ] || ! printf '%s' "$top" | grep -qE '^[A-Za-z0-9._-]+$'; then
+        log "kit: expected exactly one top-level directory, got: $top"; return 1
+    fi
+    local r
+    for r in evidence/ derived/ README.md MANIFEST.sha256 tools.list; do
+        printf '%s\n' "$list" | grep -qxF "$top/$r" || \
+            { [ "${r%/}" != "$r" ] && printf '%s\n' "$list" | grep -q "^$top/$r"; } || \
+            { log "kit: missing $top/$r"; return 1; }
+    done
+    if unzip -Z "$z" 2>/dev/null | grep -q '^l'; then log "kit: contains a symbolic link"; return 1; fi
+    if printf '%s\n' "$list" | grep -q ' '; then log "kit: some paths contain spaces (EvtxECmd wrappers fail on them)"; fi
+    printf '%s\n' "$top"
+}
+
+install_kit() {
+    local zip="$WORK/kit.zip" top staging="/cases/.$R_CASE_ID.staging" unz="/cases/.$R_CASE_ID.unzip"
+    ln -sf -- "$KIT_FOUND" "$zip"     # a path without spaces
+    local zsize free_kb
+    zsize=$(stat -L -c %s -- "$zip")
+    free_kb=$(df -Pk /cases 2>/dev/null | awk 'NR==2 {print $4}')
+    if [ -n "$free_kb" ] && [ $((free_kb * 1024)) -lt $((zsize * 2 + 1073741824)) ]; then
+        incomplete "there is not enough free disk space to unpack the case kit." \
+            "Delete large files you do not need, then run the same setup command again."
+        return 1
+    fi
+    top=$(validate_kit_zip "$zip") || {
+        incomplete "the case kit file $KIT_FOUND is not laid out as expected." \
+            "Download it again from the course site; if it happens again, tell the TA."
+        return 1; }
+    sudo mkdir -p /cases
+    sudo rm -rf "$staging" "$unz"
+    out "      unpacking the case kit..."
+    if ! run sudo unzip -q "$zip" -d "$unz" || ! sudo mv "$unz/$top" "$staging"; then
+        incomplete "the case kit could not be unpacked." \
+            "Download it again from the course site, then run the same setup command again."
+        return 1
+    fi
+    sudo rm -rf "$unz"
+    # Readable by everyone, writable by nobody but root, whatever the zip said.
+    run sudo chown -R root:root "$staging" && run sudo chmod -R u+rwX,go+rX,go-w "$staging" || return 1
+    if ! (cd "$staging" && run sudo sha256sum -c --quiet --strict MANIFEST.sha256); then
+        incomplete "the case kit's own checksums do not match: the download is damaged." \
+            "Delete $KIT_FOUND, download it again from the course site, then run the same setup command again."
+        return 1
+    fi
+    # Remember every kit file (the zip's hash was accepted, so these are authentic).
+    sudo mkdir -p "$staging/.dfir-lab"
+    sudo sh -c 'cd "$1" && find . -type f ! -path "./.dfir-lab/*" -printf "%P\n" | LC_ALL=C sort \
+        | xargs -r -d "\n" sha256sum -- > .dfir-lab/kit.sha256' sh "$staging" || return 1
+    printf '%s  %s\n' "$KIT_FOUND_SHA" "$(basename -- "$KIT_FOUND")" | sudo tee "$staging/.dfir-lab/kit-zip.sha256" > /dev/null
+    # The case overlay from this script goes on top.
+    run sudo cp -R "$PAYLOAD/case-overlay/." "$staging/" || return 1
+    run sudo cp "$PAYLOAD/overlay.sha256" "$staging/.dfir-lab/overlay.sha256" || return 1
+    compose_manifest "$staging" || return 1
+    # Keep the student's work from an earlier installation.
+    local s
+    if [ -d "$CASE_DIR/.dfir-lab" ]; then
+        for s in $STUDENT_DIRS; do
+            if [ -e "$CASE_DIR/$s" ]; then sudo rm -rf "$staging/$s"; run sudo mv "$CASE_DIR/$s" "$staging/$s"; fi
+        done
+    fi
+    fix_case_permissions "$staging" || return 1
+    if [ -e "$CASE_DIR" ] || [ -L "$CASE_DIR" ]; then
+        if [ -d "$CASE_DIR/.dfir-lab" ]; then
+            run sudo mv "$CASE_DIR" "/cases/.$R_CASE_ID.old" || return 1
+        else
+            local aside
+            aside="/cases/$R_CASE_ID.before-setup-$(date +%Y%m%d%H%M%S)"
+            run sudo mv "$CASE_DIR" "$aside" || return 1
+            NOTES+=("A folder $CASE_DIR that the setup did not create was moved to $aside.")
+        fi
+    fi
+    run sudo mv "$staging" "$CASE_DIR" || return 1
+    sudo rm -rf "/cases/.$R_CASE_ID.old"
+    return 0
+}
+
+case_kit() {
+    step 6 "Installing the case files (case $R_CASE_ID: $R_CASE_TITLE)"
+    local nfiles
+    if [ -n "$KIT_ARG" ] && [ ! -f "$KIT_ARG" ]; then
+        incomplete "the case kit file $KIT_ARG does not exist." \
+            "Check the file name after --kit, or leave --kit out to search ~/Downloads."
+        return
+    fi
+    [ -n "$KIT_ARG" ] && find_kit
+    case_verified
+    local v=$?
+    if [ "$v" -eq 2 ]; then
+        if update_overlay && case_verified; then
+            ok "updated the case instructions and checkpoints in $CASE_DIR"
+            changed; v=0
+        else
+            v=1
+        fi
+    elif [ "$v" -eq 0 ]; then
+        nfiles=$(wc -l < "$CASE_DIR/MANIFEST.lab.sha256")
+        done_already "case $R_CASE_ID is installed in $CASE_DIR ($nfiles files verified)"
+    fi
+    if [ "$v" -eq 0 ]; then CASE_OK=1; return; fi
+
+    [ -z "$KIT_ARG" ] && find_kit
+    if [ -z "$KIT_FOUND" ]; then
+        if [ ${#KIT_REJECTED[@]} -gt 0 ]; then
+            incomplete "the case kit file ${KIT_REJECTED[0]} is damaged or not the current version." \
+                "Delete it, download $R_CASE_KIT_PATTERN again from the course site inside this VM, then run the same setup command again."
+        else
+            incomplete "the case kit is not on this VM yet." \
+                "Inside this VM, download the case kit ($R_CASE_KIT_PATTERN) from the course site; it goes to ~/Downloads. Then run the same setup command again."
+        fi
+        return
+    fi
+    if ! install_kit; then
+        [ ${#INCOMPLETE[@]} -gt 0 ] || incomplete "the case files could not be installed." \
+            "Run the same setup command again; if it happens again, tell the TA and send the log."
+        return
+    fi
+    if case_verified; then
+        nfiles=$(wc -l < "$CASE_DIR/MANIFEST.lab.sha256")
+        ok "case $R_CASE_ID installed in $CASE_DIR ($nfiles files verified; evidence is read-only)"
+        CASE_OK=1
+        changed
+    else
+        incomplete "the installed case files did not verify." \
+            "Run the same setup command again; if it happens again, tell the TA and send the log."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Step 7: desktop comfort
+# ---------------------------------------------------------------------------
+
+gio_attr() {  # $1 file, $2 attribute -> value
+    gio info -a "$2" -- "$1" 2>/dev/null | awk -v a="  $2: " 'index($0, a) == 1 { print substr($0, length(a) + 1) }'
+}
+
+shortcut_ready() {  # what DING (GNOME 46 desktop icons) needs to launch a .desktop file
+    local f=$1 mode
+    [ "$(gio_attr "$f" standard::content-type)" = "application/x-desktop" ] || return 1
+    [ "$(gio_attr "$f" access::can-execute)" = "TRUE" ] || return 1
+    [ "$(gio_attr "$f" metadata::trusted)" = "true" ] || return 1
+    mode=$(stat -c %a -- "$f")
+    [ $((8#$mode & 8#002)) -eq 0 ] || return 1
+    return 0
+}
+
+explicit_default() {  # $1 = MIME type -> desktop file named in ~/.config/mimeapps.list
+    awk -F= -v t="$1" '/^\[/ { s = ($0 == "[Default Applications]") }
+        s && $1 == t { v = $2; sub(/;.*$/, "", v); print v; exit }' \
+        "${XDG_CONFIG_HOME:-$HOME/.config}/mimeapps.list" 2>/dev/null
+}
+
+bashrc_block() {
+    cat <<EOF
+$BASHRC_BEGIN
+# Added by the lab setup script ("bash bootstrap.sh --uninstall" removes it).
+# SIFT turns on noclobber earlier in this file, which makes "command > file"
+# refuse to overwrite an existing file. The lab expects overwriting to work.
+set +o noclobber
+# Claude Code is installed in ~/.local/bin.
+case ":\$PATH:" in *":\$HOME/.local/bin:"*) ;; *) PATH="\$HOME/.local/bin:\$PATH" ;; esac
+$BASHRC_END
+EOF
+}
+
+remove_bashrc_block() {
+    local rc="$HOME/.bashrc" tmp
+    [ -f "$rc" ] && grep -qxF "$BASHRC_BEGIN" "$rc" || return 1
+    tmp=$(mktemp)
+    awk -v b="$BASHRC_BEGIN" -v e="$BASHRC_END" '$0 == b { skip = 1 } !skip { print } $0 == e { skip = 0 }' "$rc" > "$tmp" \
+        && cat "$tmp" > "$rc"
+    rm -f "$tmp"
+    # Drop the blank line the setup added before the block.
+    if [ "$(tail -c 2 "$rc" | od -An -c | tr -d ' ')" = '\n\n' ]; then
+        tmp=$(mktemp); head -c -1 "$rc" > "$tmp" && cat "$tmp" > "$rc"; rm -f "$tmp"
+    fi
+    return 0
+}
+
+desktop() {
+    step 7 "Adjusting the desktop for the lab"
+    if ! session_env; then
+        warn "no desktop session was found, so the desktop settings were skipped. Run the setup command again from a terminal on the VM desktop."
+        return
+    fi
+    local before=$CHANGED
+
+    # a) Screen lock and blanking.
+    local delay lock
+    delay=$(gsettings get org.gnome.desktop.session idle-delay 2>/dev/null)
+    lock=$(gsettings get org.gnome.desktop.screensaver lock-enabled 2>/dev/null)
+    log "idle-delay=$delay lock-enabled=$lock"
+    if [ "$delay" = "uint32 0" ] && [ "$lock" = "false" ]; then
+        done_already "the screen does not lock or go blank"
+    elif run gsettings set org.gnome.desktop.session idle-delay 0 && \
+         run gsettings set org.gnome.desktop.screensaver lock-enabled false && \
+         [ "$(gsettings get org.gnome.desktop.session idle-delay)" = "uint32 0" ] && \
+         [ "$(gsettings get org.gnome.desktop.screensaver lock-enabled)" = "false" ]; then
+        run gsettings set org.gnome.desktop.screensaver ubuntu-lock-on-suspend false || true
+        ok "turned off the screen lock and screen blanking"
+        changed
+    else
+        warn "could not turn off the screen lock (the screen locks after 5 idle minutes; the password is forensics)"
+    fi
+
+    # b) Chromium as the browser for web links (Firefox on this VM is a broken
+    #    stub). Chromium is already the implicit choice while it is the only
+    #    registered handler; write it as the explicit default in
+    #    ~/.config/mimeapps.list so that stays true.
+    if [ ! -f "/var/lib/snapd/desktop/applications/$BROWSER_DESKTOP" ]; then
+        warn "Chromium was not found, so the default browser was not changed"
+    else
+        local t missing=0
+        for t in x-scheme-handler/http x-scheme-handler/https text/html; do
+            [ "$(explicit_default "$t")" = "$BROWSER_DESKTOP" ] || missing=1
+        done
+        log "explicit defaults: http=$(explicit_default x-scheme-handler/http) https=$(explicit_default x-scheme-handler/https) html=$(explicit_default text/html); xdg-settings=$(xdg-settings get default-web-browser 2>/dev/null)"
+        if [ "$missing" -eq 0 ]; then
+            done_already "Chromium opens web links"
+        else
+            run xdg-settings set default-web-browser "$BROWSER_DESKTOP"
+            run xdg-mime default "$BROWSER_DESKTOP" x-scheme-handler/http x-scheme-handler/https text/html
+            if [ "$(explicit_default x-scheme-handler/https)" = "$BROWSER_DESKTOP" ] && \
+               [ "$(explicit_default x-scheme-handler/http)" = "$BROWSER_DESKTOP" ] && \
+               gio mime x-scheme-handler/https 2>/dev/null | grep -q "^Default application.*: $BROWSER_DESKTOP\$"; then
+                ok "Chromium now opens web links"
+                changed
+            else
+                warn "could not make Chromium the default browser; open links by copying them into Chromium"
+            fi
+        fi
+    fi
+
+    # c) ~/.bashrc: noclobber off, ~/.local/bin on PATH.
+    local rc="$HOME/.bashrc" want have
+    want=$(bashrc_block)
+    if grep -qxF "$BASHRC_BEGIN" "$rc" 2>/dev/null; then
+        have=$(awk -v b="$BASHRC_BEGIN" -v e="$BASHRC_END" '$0 == b { p = 1 } p { print } $0 == e { p = 0 }' "$rc")
+        if [ "$have" = "$want" ]; then
+            done_already "new terminals let '>' overwrite files (noclobber off)"
+        else
+            remove_bashrc_block
+            printf '\n%s\n' "$want" >> "$rc"
+            ok "updated the lab block in ~/.bashrc"
+            changed
+        fi
+    elif printf '\n%s\n' "$want" >> "$rc"; then
+        ok "new terminals let '>' overwrite files (turned noclobber off in ~/.bashrc)"
+        changed
+    else
+        warn "could not change ~/.bashrc; in a terminal, '>' will not overwrite existing files (use '>|')"
+    fi
+
+    # d) Desktop shortcuts: DING launches a .desktop file only when it is a
+    #    valid desktop file, executable, not writable by others, in a Desktop
+    #    folder not writable by others, and has metadata::trusted = true.
+    local s f bad=() fixed=0 dmode
+    dmode=$(stat -c %a -- "$HOME/Desktop" 2>/dev/null || echo 0)
+    if [ $((8#$dmode & 8#002)) -ne 0 ]; then run chmod o-w "$HOME/Desktop"; fi
+    for s in $SHORTCUTS; do
+        f="$HOME/Desktop/$s.desktop"
+        [ -f "$f" ] || { bad+=("$s"); continue; }
+        shortcut_ready "$f" && continue
+        run chmod 755 "$f"
+        run gio set -- "$f" metadata::trusted true
+        if shortcut_ready "$f"; then fixed=$((fixed + 1)); else bad+=("$s"); fi
+    done
+    for s in $SHORTCUTS; do
+        f="$HOME/Desktop/$s.desktop"
+        [ -f "$f" ] && log "$s: type=$(gio_attr "$f" standard::content-type) exec=$(gio_attr "$f" access::can-execute) trusted=$(gio_attr "$f" metadata::trusted) mode=$(stat -c %a "$f")"
+    done
+    if [ ${#bad[@]} -gt 0 ]; then
+        warn "could not mark these desktop shortcuts as trusted: ${bad[*]}. Right-click each one and choose 'Allow Launching'."
+    elif [ "$fixed" -gt 0 ]; then
+        ok "marked the lab's desktop shortcuts as trusted (double-click runs them)"
+        changed
+    else
+        done_already "the lab's desktop shortcuts are trusted (double-click runs them)"
+    fi
+    [ "$CHANGED" -eq "$before" ] || log "desktop settings changed"
+}
+
+# ---------------------------------------------------------------------------
+# Step 8: readiness check and summary
+# ---------------------------------------------------------------------------
+
+finish_checks() {
+    step 8 "Checking the result"
+    if [ "$TOOLKIT_OK" -ne 1 ] || ! command -v dfir-lab > /dev/null 2>&1; then
+        out "      skipped: the lab toolkit is not installed"
+        return
+    fi
+    local json rc
+    json=$(dfir-lab check --quick --json --no-gui 2>> "$LOG" < /dev/null)
+    rc=$?
+    log "dfir-lab check --quick --json (exit $rc):"
+    printf '%s\n' "$json" >> "$LOG"
+    if ! command -v jq > /dev/null 2>&1 || ! printf '%s' "$json" | jq -e '.results' > /dev/null 2>&1; then
+        if dfir-lab check --only 1,2,3 --no-gui >> "$LOG" 2>&1 < /dev/null; then
+            out "      passed: system, tools and case files"
+        else
+            incomplete "the readiness check found a problem with the system, the tools or the case files." \
+                "Run  dfir-lab check  for details, or tell the TA and send the log."
+        fi
+        return
+    fi
+    local id status result todo name
+    for id in 1 2 3 4 5; do
+        status=$(printf '%s' "$json" | jq -r ".results[] | select(.id == $id) | .status")
+        result=$(printf '%s' "$json" | jq -r ".results[] | select(.id == $id) | .result")
+        todo=$(printf '%s' "$json" | jq -r ".results[] | select(.id == $id) | .todo")
+        name=$(printf '%s' "$json" | jq -r ".results[] | select(.id == $id) | .name")
+        [ -n "$status" ] || continue
+        if [ "$CASE_OK" -ne 1 ] && { [ "$id" = 2 ] || [ "$id" = 3 ]; } && [ "$status" != "PASS" ]; then
+            # Follows from the missing case files, which are already listed.
+            out "      waiting: $name (needs the case files)"
+            continue
+        fi
+        case "$id:$status" in
+            [123]:PASS) out "      passed: $name: $result" ;;
+            [123]:WARN) out "      warning: $name: $result"; WARNINGS+=("$name: $result") ;;
+            [123]:SKIP) out "      skipped: $name: $result" ;;
+            [123]:*) incomplete "readiness check '$name' failed: $result" "${todo:-Tell the TA and send the log.}" ;;
+            4:PASS) out "      passed: Duke AI key: stored" ;;
+            4:*) out "      not yet: no Duke AI key is stored (that is your next step)" ;;
+            5:PASS) out "      passed: Duke AI gateway: reachable" ;;
+            5:*) out "      not now: the Duke AI gateway cannot be reached from this VM"
+                 NOTES+=("The Duke AI gateway was not reachable during setup. Before the lab, connect your computer to the Duke VPN (or the Duke network); \"Check my setup\" tests it.") ;;
+        esac
+    done
+}
+
+summary() {
+    end_step
+    local line="================================================================"
+    out ""
+    out "$line"
+    if [ ${#INCOMPLETE[@]} -eq 0 ]; then
+        out " SETUP COMPLETE"
+    else
+        out " SETUP INCOMPLETE: run the same command again after doing what is listed below"
+    fi
+    out "$line"
+    out " Installed:"
+    local psift="not installed" tk="not installed" cs="not installed" cc="not installed"
+    [ "$CLAUDE_OK" -eq 1 ] && cc="$CLAUDE_FOUND   ($CLAUDE_BIN)"
+    [ "$PSIFT_OK" -eq 1 ] && psift="${R_PROTOCOL_SIFT_COMMIT:0:7}   (~/.claude)"
+    [ "$TOOLKIT_OK" -eq 1 ] && tk="$R_VERSION   (dfir-lab, desktop shortcuts)"
+    [ "$CASE_OK" -eq 1 ] && cs="$R_CASE_ID   ($CASE_DIR)"
+    out "   Claude Code     $cc"
+    out "   Protocol SIFT   $psift"
+    out "   Lab toolkit     $tk"
+    out "   Case files      $cs"
+    if [ ${#INCOMPLETE[@]} -gt 0 ]; then
+        out ""
+        out " Not finished:"
+        local item
+        for item in "${INCOMPLETE[@]}"; do
+            out "   - ${item%%|*}"
+            out "     What to do: ${item#*|}"
+        done
+        out ""
+        out " Running the command again is safe: it skips everything that is already done."
+    fi
+    if [ ${#WARNINGS[@]} -gt 0 ]; then
+        out ""
+        out " Warnings (the lab still works):"
+        local w
+        for w in "${WARNINGS[@]}"; do out "   - $w"; done
+    fi
+    if [ ${#NOTES[@]} -gt 0 ]; then
+        out ""
+        local n
+        for n in "${NOTES[@]}"; do out " Note: $n"; done
+    fi
+    out ""
+    if [ "$CHANGED" -eq 0 ] && [ ${#INCOMPLETE[@]} -eq 0 ]; then
+        out " This run changed nothing: everything was already set up."
+    elif [ "$CHANGED" -eq 0 ]; then
+        out " This run changed nothing."
+    fi
+    out " Log: $LOG"
+    if [ ${#INCOMPLETE[@]} -eq 0 ]; then
+        out ""
+        out " Next steps:"
+        out "   1. Double-click \"Set up Duke AI access\" on the desktop and paste your Duke AI key."
+        out "   2. Double-click \"Check my setup\"."
+    fi
+    out "$line"
+    log "finished: changed=$CHANGED incomplete=${#INCOMPLETE[@]} warnings=${#WARNINGS[@]} seconds=$SECONDS"
+}
+
+# ---------------------------------------------------------------------------
+# Uninstall
+# ---------------------------------------------------------------------------
+
+uninstall() {
+    out "CYBERSEC 510 DFIR lab setup $R_VERSION: removing the lab setup$([ "$PURGE" -eq 1 ] && echo ' (purge)')"
+    out "Log: $LOG"
+    if [ "$PURGE" -eq 1 ] && [ "$YES" -ne 1 ]; then
+        out ""
+        out "--purge also deletes Claude Code, ~/.claude (Protocol SIFT and your Claude Code"
+        out "sessions), your stored Duke AI key, ~/dfir-lab and your work in $CASE_DIR."
+        if [ -t 0 ]; then
+            local ans=""
+            read -r -p "Type yes to delete all of that: " ans
+            [ "$ans" = "yes" ] || { out "Stopped. Nothing was changed."; exit 2; }
+        else
+            out "Stopped. Nothing was changed. (Add --yes to confirm.)"; exit 2
+        fi
+    fi
+    sudo -n true 2>/dev/null || sudo -v || die "administrator rights are needed."
+    local args=(--user "$(id -un)" --uninstall)
+    [ "$PURGE" -eq 1 ] && args+=(--purge)
+    if run sudo sh "$PAYLOAD/lab/install.sh" "${args[@]}"; then
+        out "  removed the lab toolkit (dfir-lab, desktop shortcuts, /etc/dfir-lab); Claude Code settings restored"
+    else
+        out "  WARNING: the toolkit uninstaller reported a problem (see the log)"
+    fi
+    sudo rm -f "$TOOLKIT_STAMP"
+    sudo rmdir /usr/local/lib/dfir-lab 2>/dev/null || true
+    if [ -d "$CASE_DIR" ]; then
+        if [ "$PURGE" -eq 1 ]; then
+            run sudo rm -rf "$CASE_DIR"
+            out "  removed $CASE_DIR"
+        else
+            local item keep=0
+            for item in "$CASE_DIR"/* "$CASE_DIR"/.[!.]*; do
+                [ -e "$item" ] || continue
+                case " $STUDENT_DIRS " in *" $(basename -- "$item") "*)
+                    if [ -n "$(ls -A -- "$item" 2>/dev/null)" ]; then keep=1; continue; fi ;;
+                esac
+                sudo rm -rf -- "$item"
+            done
+            if [ "$keep" -eq 1 ]; then
+                sudo chown "$(id -un):$(id -gn)" "$CASE_DIR"
+                out "  removed the case files from $CASE_DIR; kept your work there"
+            else
+                sudo rmdir "$CASE_DIR" 2>/dev/null
+                out "  removed $CASE_DIR"
+            fi
+        fi
+    fi
+    if remove_bashrc_block; then out "  removed the lab block from ~/.bashrc"; fi
+    if [ "$PURGE" -eq 1 ]; then
+        rm -rf "$HOME/.local/bin/claude" "$HOME/.local/share/claude" "$HOME/.cache/claude" \
+               "$HOME/.claude" "$HOME/.claude.json" "$HOME/.claude.json.backup"
+        out "  removed Claude Code, ~/.claude (Protocol SIFT), your Duke AI key and ~/dfir-lab"
+    else
+        out "  kept: Claude Code, Protocol SIFT (~/.claude), your Duke AI key and your work"
+    fi
+    out "  not undone: the open-vm-tools-desktop package, the screen-lock and default-browser settings"
+    out "Done."
+    log "uninstall finished"
+}
+
+# ---------------------------------------------------------------------------
+
+main() {
+    parse_args "$@"
+    refuse_root
+    SELF=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null)
+    if [ -z "$SELF" ] || [ ! -f "$SELF" ]; then
+        echo "Save bootstrap.sh to a file and run it with: bash bootstrap.sh"
+        exit 2
+    fi
+    start_log
+    take_lock
+    trap cleanup EXIT
+    trap on_interrupt INT TERM
+    extract_payload
+    if [ "$MODE" = "uninstall" ]; then
+        uninstall
+        exit 0
+    fi
+    out "CYBERSEC 510 DFIR lab setup (version $R_VERSION)"
+    out "This prepares this SIFT virtual machine for the lab. It needs internet access"
+    out "and usually takes a few minutes. It is safe to run again: finished steps are skipped."
+    out "Full log: $LOG"
+    out ""
+    preflight
+    packages
+    claude_code
+    protocol_sift
+    toolkit
+    case_kit
+    desktop
+    finish_checks
+    summary
+    [ ${#INCOMPLETE[@]} -eq 0 ] && exit 0
+    exit 1
+}
+
+main "$@"
+exit 3

@@ -1,0 +1,36 @@
+{
+  "format": 1,
+  "case": "szechuan",
+  "checkpoints": [
+    {
+      "id": 1,
+      "title": "PLACEHOLDER checkpoint 1",
+      "question": "PLACEHOLDER: from which IP address did the remote logon in the stand-in evidence come?",
+      "normalize": "ip",
+      "pattern": null,
+      "then": null,
+      "salt": "e033ebb869167e19bf02e17d6e156fb5",
+      "hash": "eb0012da0369ce7589adb957c53d6cc67b0f5bba13d3f11752bdcf1fc00c4bba",
+      "alternates": [],
+      "hints": [
+        "PLACEHOLDER hint: look at events 4624 and 4625."
+      ],
+      "success": "PLACEHOLDER: right. The real checkpoints are not written yet."
+    },
+    {
+      "id": 2,
+      "title": "PLACEHOLDER checkpoint 2",
+      "question": "PLACEHOLDER: which event ID records the installation of a new service?",
+      "normalize": "exact",
+      "pattern": null,
+      "then": null,
+      "salt": "94a16f64ff351d29ad9db9e593ec0f65",
+      "hash": "67fff656ba410a5de27a6a742c42d16fb811cbd98e7d6ea23844e03622c6d7a4",
+      "alternates": [],
+      "hints": [
+        "PLACEHOLDER hint: look in the system events."
+      ],
+      "success": "PLACEHOLDER: right. The real checkpoints are not written yet."
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "name": "readiness",
+  "description": "Satisfies dfir-lab readiness check 10: Claude Code runs 'sh readiness.sh' with its Bash tool, then answers DONE.",
+  "match": "readiness.sh",
+  "steps": [
+    {"tool_use": {"name": "Bash", "input": {"command": "sh readiness.sh", "description": "Run the DFIR lab readiness script"}}},
+    {"text": "DONE"}
+  ],
+  "final_text": "DONE"
+}

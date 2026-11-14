@@ -1,0 +1,9 @@
+{"type": "prompt", "text": "Look at the security events. Did anyone log on remotely?"}
+{"type": "assistant_text", "text": "I'll start by listing the logon events in the security log export."}
+{"type": "tool_call", "tool": "Bash", "command": "grep -E ',(4624|4625),' evidence/security-events.csv", "args": {"command": "grep -E ',(4624|4625),' evidence/security-events.csv"}}
+{"type": "tool_result", "output": "1001,2020-09-19 03:10:02,4624,svc_backup,10.42.85.20,3\n1002,2020-09-19 03:21:41,4625,Administrator,203.0.113.77,3\n1003,2020-09-19 03:21:43,4625,Administrator,203.0.113.77,3\n1004,2020-09-19 03:21:44,4625,Administrator,203.0.113.77,3\n1005,2020-09-19 03:21:46,4624,Administrator,203.0.113.77,10", "truncated": false, "note": ""}
+{"type": "pause", "question": "Before you continue: which of these records would you open first to verify a remote logon, and why?"}
+{"type": "assistant_text", "text": "Three failed logons (4625) from 203.0.113.77 are followed by a successful logon (4624, logon type 10 = remote interactive) from the same address at 03:21:46 UTC. That pattern suggests password guessing followed by success. Verify record 1005 yourself before you write it down."}
+{"type": "tool_call", "tool": "Bash", "command": "cat evidence/system-events.csv", "args": {"command": "cat evidence/system-events.csv"}}
+{"type": "tool_result", "output": "record,time_utc,event_id,service_name,image_path\n2001,2020-09-19 02:58:00,7036,W32Time,C:\\Windows\\System32\\svchost.exe\n2002,2020-09-19 03:25:10,7045,updatesvc,C:\\Windows\\Temp\\upd.exe", "truncated": true, "note": "output truncated in this recording: 1 more line"}
+{"type": "assistant_text", "text": "A service named updatesvc was installed at 03:25:10 UTC, four minutes after the remote logon, running a program from C:\\Windows\\Temp. That is a common persistence technique."}
