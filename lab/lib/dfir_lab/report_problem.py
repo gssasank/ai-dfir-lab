@@ -3,7 +3,7 @@
 import platform
 import subprocess
 
-from . import check, disk, fsutil, keystore, paths, ui
+from . import check, disk, fsutil, keystore, paths, route as route_mod, subscription, ui
 from .claude_env import find_claude, process_env
 from .errors import LabError
 from .gateway import Gateway, probe_network
@@ -28,7 +28,7 @@ def _claude_version(cfg):
     try:
         p = subprocess.run([exe, "--version"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                            stderr=subprocess.STDOUT, text=True, timeout=20,
-                           env=process_env(cfg))
+                           env=process_env(cfg, route=route_mod.DUKE))
         return (p.stdout or "").strip().splitlines()[0] if p.stdout.strip() else \
             "no output (exit %d)" % p.returncode
     except (OSError, subprocess.TimeoutExpired, IndexError):
@@ -60,6 +60,31 @@ def _network(cfg):
     return lines
 
 
+def _anthropic_network(cfg):
+    """Subscription route: Anthropic's hosts instead of the gateway. No request
+    with a credential is made."""
+    lines = []
+    for url in cfg.subscription_hosts:
+        net = probe_network(url, cfg.connect_timeout)
+        lines.append("%s: %s%s%s" % (
+            net.host, net.kind, (" - " + net.detail) if net.detail else "",
+            (", %s, %.0f ms, TLS %s" % (net.address, net.connect_ms, net.tls_version))
+            if net.ok else ""))
+    return lines
+
+
+def _signin(cfg):
+    """One line about the Claude sign-in: method and plan only (no email,
+    no organisation, never the credential)."""
+    try:
+        exe = find_claude(cfg)
+    except LabError:
+        return "unknown (Claude Code not found)"
+    st = subscription.auth_status(cfg, exe)
+    return "%s (method %s%s)" % (subscription.describe(st), st.method,
+                                 (", ends " + st.expires) if st.expires else "")
+
+
 def run(cfg):
     latest = paths.readiness_dir() / "latest.txt"
     if not latest.is_file():
@@ -70,9 +95,12 @@ def run(cfg):
             ui.problem(exc.what, exc.todo)
     facts = check.system_facts()
     key = keystore.status()
+    route = route_mod.current()
+    sub = route == route_mod.SUBSCRIPTION
     sections = [
         "DFIR Lab problem report",
-        "This file does NOT contain your Duke AI key. It is safe to send to the TA.",
+        "This file does NOT contain your Duke AI key or your Claude sign-in. It is safe to "
+        "send to the TA.",
         "",
         "== Basics ==",
         "created (UTC): %s" % fsutil.utc_iso(),
@@ -88,10 +116,12 @@ def run(cfg):
         "Claude Code: %s" % _claude_version(cfg),
         "key stored: %s" % ("yes, %d characters, mode %o" % (key["length"], key["mode"])
                             if key["present"] else "no"),
-        "",
-        "== Network ==",
+        "AI access route: %s" % ("own Claude subscription" if sub else "Duke AI Gateway key"),
     ]
-    sections += _network(cfg)
+    if sub:
+        sections.append("Claude sign-in: %s" % _signin(cfg))
+    sections += ["", "== Network =="]
+    sections += _anthropic_network(cfg) if sub else _network(cfg)
     sections += ["", "== Disk image =="]
     try:
         ds = disk.settings(cfg)

@@ -9,6 +9,8 @@
       "Read(~/.config/dfir-lab/**)",
       "Read(~/.config/dfir-lab)",
       "Edit(~/.config/dfir-lab/**)",
+      "Read(~/.claude/.credentials.json)",
+      "Edit(~/.claude/.credentials.json)",
       "WebFetch",
       "WebSearch",
       "Workflow",

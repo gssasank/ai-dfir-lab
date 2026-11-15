@@ -17,6 +17,10 @@ model_small = @MODEL_SMALL@
 binary = @CLAUDE_BINARY@
 effort = @CLAUDE_EFFORT@
 
+[subscription]
+; Optional route: the student's own Claude subscription (dfir-lab use subscription).
+model = @SUBSCRIPTION_MODEL@
+
 [case]
 id = @CASE_ID@
 title = @CASE_TITLE@

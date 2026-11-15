@@ -63,7 +63,7 @@ class InstallerTests(helpers.LabTestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("(marked trusted)", r.stdout)
         lines = log.read_text().splitlines()
-        self.assertEqual(len(lines), 4, lines)
+        self.assertEqual(len(lines), 5, lines)
         for line in lines:
             self.assertIn("metadata::trusted true", line)
             self.assertTrue(line.endswith("bus=unix:path=%s/bus" % runtime), line)
@@ -92,7 +92,8 @@ class InstallerTests(helpers.LabTestCase):
         self.assertTrue(os.access(desk, os.X_OK))
         self.assertEqual(sorted(p.name for p in (self.staged_home / "Desktop").glob("dfir-lab-*.desktop")),
                          ["dfir-lab-check.desktop", "dfir-lab-replay.desktop",
-                          "dfir-lab-setup-key.desktop", "dfir-lab-start.desktop"])
+                          "dfir-lab-setup-key.desktop", "dfir-lab-start.desktop",
+                          "dfir-lab-use-subscription.desktop"])
         self.assertFalse((self.staged_home / "dfir-lab" / "submissions").exists())
         settings = self.staged_home / ".claude" / "settings.json"
         s = json.loads(settings.read_text())

@@ -59,7 +59,7 @@ LIB="$ROOT/usr/local/lib/dfir-lab"
 ETC="$ROOT/etc/dfir-lab"
 APPS="$ROOT/usr/local/share/applications"
 DESKTOP="$HOME_DIR/Desktop"
-SHORTCUTS="dfir-lab-setup-key dfir-lab-start dfir-lab-check dfir-lab-replay"
+SHORTCUTS="dfir-lab-setup-key dfir-lab-start dfir-lab-check dfir-lab-replay dfir-lab-use-subscription"
 STUDENT_BINS="dfir-lab dfir-lab-configure-claude"
 
 PY=$(command -v python3 || true)

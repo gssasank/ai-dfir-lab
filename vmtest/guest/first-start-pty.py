@@ -27,7 +27,7 @@ import termios
 import time
 from pathlib import Path
 
-THEME_SCREEN = ("Choose the text style", "Let's get started")
+THEME_SCREEN = ("Choose the text style", "Let's get started", "Make auto mode your default")
 TRUST_SCREEN = ("trust this folder", "Quick safety check", "Accessing workspace",
                 "Do you trust the files")
 LOGIN_SCREEN = ("Select login method", "Claude account with subscription",

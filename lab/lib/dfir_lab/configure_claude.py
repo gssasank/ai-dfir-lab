@@ -2,9 +2,16 @@
 Claude Code settings file (~/.claude/settings.json, or
 $CLAUDE_CONFIG_DIR/settings.json).
 
+The settings follow the student's route (route.py): the Duke route locks
+Claude Code to the gateway as below; the subscription route removes that lock
+(no apiKeyHelper, no gateway URL, no credential or provider variables, no
+IS_DEMO, no forced effort) and keeps everything else, including the deny
+rules and the guard hook.
+
 Merge rules (spec 6.1):
 - lists are unioned without duplicates, existing order kept, ours appended;
-- our `env` values and `apiKeyHelper` win;
+- our `env` values and `apiKeyHelper` win (subscription route: the variables
+  in claude_env.removed_settings_vars and apiKeyHelper are deleted);
 - unrelated keys are preserved;
 - the previous file is backed up once (settings.json.pre-dfir-lab);
 - running it again changes nothing.
@@ -35,21 +42,38 @@ import shutil
 import sys
 from pathlib import Path
 
-from . import paths, ui
-from .claude_env import settings_env
+from . import paths, route as route_mod, ui
+from .claude_env import removed_settings_vars, settings_env
 from .config import Config
 from .errors import ConfigError, LabError
 from .fsutil import write_text_atomic
 
 BACKUP_SUFFIX = ".pre-dfir-lab"
 ABSENT_MARKER_SUFFIX = ".pre-dfir-lab.absent"
+# Claude Code state flags (~/.claude.json) set on the subscription route, where
+# IS_DEMO is not used. All three are undocumented and were observed with
+# Claude Code 2.1.322:
+# - hasCompletedOnboarding: no theme picker / onboarding screens;
+# - hasSeenAutoDefaultNudge: without it, a session that has
+#   hasCompletedOnboarding and a non-auto permissions.defaultMode in the user
+#   settings (Protocol SIFT sets "acceptEdits") asks "Make auto mode your
+#   default permission mode?" with Yes preselected, and Enter rewrites the
+#   student's defaultMode to "auto";
+# - hasSeenAutoDefaultNotice: the "Auto mode is now Claude Code's default
+#   permission mode" banner, which would be wrong next to acceptEdits.
+FIRST_RUN_FLAGS = ("hasCompletedOnboarding", "hasSeenAutoDefaultNudge", "hasSeenAutoDefaultNotice")
 
 
 BUILTIN_FRAGMENT = {
     "apiKeyHelper": "@LIBEXEC@/key-helper",
     "env": {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "DISABLE_AUTOUPDATER": "1"},
     "permissions": {"deny": ["Read(~/.config/dfir-lab/**)", "Read(~/.config/dfir-lab)",
-                             "Edit(~/.config/dfir-lab/**)", "WebFetch", "WebSearch",
+                             "Edit(~/.config/dfir-lab/**)",
+                             # The subscription sign-in (both routes: it stays on the
+                             # VM after switching back to the Duke key).
+                             "Read(~/.claude/.credentials.json)",
+                             "Edit(~/.claude/.credentials.json)",
+                             "WebFetch", "WebSearch",
                              # Tools the lab never uses; a denied tool is left out of every
                              # request (measured 2026-11-14: ~5,900 fewer tokens per request).
                              "Workflow", "ScheduleWakeup", "ReportFindings", "ListAgents",
@@ -99,13 +123,31 @@ def _quote_commands(frag):
     return frag
 
 
-def fragment(cfg, libexec=None):
+def credential_deny_rules():
+    """Deny rules for the subscription sign-in file. ~/.claude/... is in the
+    fragment; when $CLAUDE_CONFIG_DIR moves the file elsewhere, an absolute
+    rule (//path, code.claude.com/docs/en/permissions) is added for it."""
+    cred = paths.claude_credentials_file()
+    default = paths.home() / ".claude" / paths.CREDENTIALS_NAME
+    if os.path.abspath(str(cred)) == os.path.abspath(str(default)):
+        return []
+    absolute = "/" + os.path.abspath(str(cred))
+    return ["Read(%s)" % absolute, "Edit(%s)" % absolute]
+
+
+def fragment(cfg, libexec=None, route=None):
+    """The course settings for a route (default: the stored route). The
+    subscription fragment has no apiKeyHelper; merge() removes it."""
+    route = route_mod.resolve(route)
     libexec = str(Path(libexec) if libexec else paths.libexec_dir())
     frag = _quote_commands(_fill(_template(), libexec))
+    if route == route_mod.SUBSCRIPTION:
+        frag.pop("apiKeyHelper", None)
     env = dict(frag.get("env") or {})
-    env.update(settings_env(cfg))
+    env.update(settings_env(cfg, route))
     frag["env"] = env
-    frag.setdefault("permissions", {}).setdefault("deny", [])
+    deny = frag.setdefault("permissions", {}).setdefault("deny", [])
+    deny.extend(r for r in credential_deny_rules() if r not in deny)
     frag.setdefault("hooks", {})
     return frag
 
@@ -161,18 +203,30 @@ def _reconcile_hooks(existing, ours):
     return out
 
 
-def merge(current, frag):
-    """Pure function: returns the merged settings dict."""
+def merge(current, frag, route=None):
+    """Pure function: returns the merged settings dict for a route (default:
+    the stored route; it must match the fragment's route).
+
+    Duke route: apiKeyHelper is ours. Subscription route: apiKeyHelper and the
+    gateway variables (claude_env.removed_settings_vars) are removed, so
+    switching in either direction leaves one complete configuration and never
+    a half-locked one. Everything else in the file is kept."""
+    route = route_mod.resolve(route)
     if not isinstance(current, dict):
         current = {}
     merged = copy.deepcopy(current)
-    merged["apiKeyHelper"] = frag["apiKeyHelper"]
+    if route == route_mod.SUBSCRIPTION:
+        merged.pop("apiKeyHelper", None)
+    else:
+        merged["apiKeyHelper"] = frag["apiKeyHelper"]
 
     # Our values win. This includes the empty values that neutralise any
     # ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN / CLAUDE_CODE_USE_* already in
     # the file (see claude_env.settings_env).
     env = merged.get("env")
     env = dict(env) if isinstance(env, dict) else {}
+    for name in removed_settings_vars(route):
+        env.pop(name, None)
     env.update(frag["env"])
     merged["env"] = env
 
@@ -193,8 +247,8 @@ def merge(current, frag):
     return merged
 
 
-def is_configured(current, frag):
-    return isinstance(current, dict) and merge(current, frag) == current
+def is_configured(current, frag, route=None):
+    return isinstance(current, dict) and merge(current, frag, route) == current
 
 
 def _fs_error(action, path, exc):
@@ -227,15 +281,18 @@ def _load(path):
     return data
 
 
-def apply(cfg, settings_path=None, libexec=None, dry_run=False):
-    """Merge into the settings file. Returns (changed, path, merged).
+def apply(cfg, settings_path=None, libexec=None, dry_run=False, route=None):
+    """Merge into the settings file for a route (default: the stored route).
+    Returns (changed, path, merged).
 
     changed is False when the file already held the course settings ("nothing
     to change"). Any failure raises ConfigError (exit code 3): the file could
-    not be read, is not valid JSON, or could not be written."""
+    not be read, is not valid JSON, or could not be written. The file is
+    replaced in one atomic write, so it always holds one whole route."""
+    route = route_mod.resolve(route)
     path = Path(settings_path) if settings_path else paths.claude_settings_file()
     current = _load(path)
-    merged = merge(current or {}, fragment(cfg, libexec))
+    merged = merge(current or {}, fragment(cfg, libexec, route), route)
     if current is not None and merged == current:
         return False, path, merged
     if dry_run:
@@ -261,21 +318,32 @@ def apply(cfg, settings_path=None, libexec=None, dry_run=False):
     return True, path, merged
 
 
-def ensure(cfg, quiet=False):
-    """Make sure the course settings are in place before Claude Code runs.
+def ensure(cfg, quiet=False, route=None):
+    """Make sure the course settings for the route (default: the stored
+    route) are in place before Claude Code runs.
 
     Returns True when the file was changed (e.g. another installer had
     replaced it) and False when nothing needed changing. Raises ConfigError
     when the settings could not be read, merged or written; callers must then
     not start Claude Code (spec 6.4)."""
-    changed, path, _ = apply(cfg)
+    changed, path, _ = apply(cfg, route=route)
     if changed and not quiet:
         ui.out("Note: the Claude Code settings in %s were missing the course entries and "
                "have been restored." % path)
     return changed
 
 
-def trust_case_folder(cfg, global_config=None):
+def prepare_first_run(cfg, route=None, global_config=None):
+    """Seed Claude Code's first-run state for a route (default: the stored
+    route): the folder trust on both routes; on the subscription route also
+    hasCompletedOnboarding, which skips the theme picker without IS_DEMO (that
+    variable hides the account). Re-done at every start, because /logout
+    resets the first-run state (code.claude.com/docs/en/authentication)."""
+    onboarding = route_mod.resolve(route) == route_mod.SUBSCRIPTION
+    return trust_case_folder(cfg, global_config, onboarding=onboarding)
+
+
+def trust_case_folder(cfg, global_config=None, onboarding=False):
     """Pre-accept Claude Code's workspace-trust question for the case folder
     (spec 6.4), so a student's first interactive start lands at the prompt.
 
@@ -284,7 +352,11 @@ def trust_case_folder(cfg, global_config=None):
     docs describe this key for trusting a folder by hand
     (code.claude.com/docs/en/permissions, "What runs before you trust a
     folder"); the file itself is Claude Code's own and otherwise undocumented.
-    Everything else in the file is kept.
+    With onboarding=True it also sets FIRST_RUN_FLAGS (undocumented; observed
+    with 2.1.322: no theme picker, no auto-mode nudge or banner, and a session
+    that is not signed in says "Not logged in · Run /login"). Everything else in the
+    file is kept, and the file is written as Claude Code wrote it (no
+    redaction pass over Claude Code's own state).
 
     Returns (ok, message). Never raises: if this fails the student just sees
     the trust question once, which the start banner explains."""
@@ -316,6 +388,12 @@ def trust_case_folder(cfg, global_config=None):
             entry["hasTrustDialogAccepted"] = True
             projects[k] = entry
             changed = True
+    seeded = False
+    if onboarding:
+        for flag in FIRST_RUN_FLAGS:
+            if data.get(flag) is not True:
+                data[flag] = True
+                changed = seeded = True
     if not changed:
         return True, "the case folder is already trusted in %s" % gpath
     data["projects"] = projects
@@ -325,10 +403,11 @@ def trust_case_folder(cfg, global_config=None):
     except OSError:
         pass
     try:
-        write_text_atomic(gpath, json.dumps(data, indent=2) + "\n", mode=mode)
+        write_text_atomic(gpath, json.dumps(data, indent=2) + "\n", mode=mode, redacted=False)
     except OSError as exc:
         return False, "could not write %s (%s)" % (gpath, exc.strerror or exc)
-    return True, "marked the case folder %s as trusted in %s" % (case, gpath)
+    return True, "marked the case folder %s as trusted%s in %s" % (
+        case, " and the first-run screens as done" if seeded else "", gpath)
 
 
 def restore(settings_path=None):
@@ -385,8 +464,10 @@ def main(argv=None):
         ui.out("Updated Claude Code settings: %s" % path)
     else:
         ui.out("Claude Code settings already up to date: %s" % path)
+    ui.out("AI access: %s (change with: dfir-lab use duke | dfir-lab use subscription)"
+           % route_mod.LABELS[route_mod.current()])
     if cfg.get("case", "dir"):
-        ok, msg = trust_case_folder(cfg)
+        ok, msg = prepare_first_run(cfg)
         ui.out(("First start: %s" if ok else "Note: could not pre-accept the folder trust "
                 "question (%s); Claude Code will ask once.") % msg)
     return 0

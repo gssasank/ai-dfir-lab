@@ -34,12 +34,22 @@ Follow this page before class to turn a SANS SIFT Workstation virtual machine (V
 
 <!-- BEGIN STUDENT COMMAND -->
 ```
-curl -fsSLO https://raw.githubusercontent.com/gssasank/ai-dfir-lab/v1.0.0/dist/bootstrap.sh && echo "107b630eefd0c298558e46224fc846640103ed7e38d95e6f8af984e6476d8cb8  bootstrap.sh" | sha256sum -c && bash bootstrap.sh
+curl -fsSLO https://raw.githubusercontent.com/gssasank/ai-dfir-lab/v1.1.0/dist/bootstrap.sh && echo "0df711e126ec48503df430c0dca81861661981c4d9390d870367ceb884ee9e3f  bootstrap.sh" | sha256sum -c && bash bootstrap.sh
 ```
 <!-- END STUDENT COMMAND -->
 
 The command downloads the setup script, checks its SHA-256, and runs it. The script downloads Claude Code, Protocol SIFT and the log kit itself, and unpacks the disk image from your Downloads folder; it needs internet access, usually takes a few minutes, and is safe to run again.
 If copy and paste from your own computer into the VM does not work, open this page in Chromium inside the VM and copy the command there.
+
+## Optional: use your own Claude subscription instead of a Duke key
+
+If you already pay for Claude (Pro, Max or higher), the lab's AI assistant can use your subscription instead of a Duke AI Gateway key. It needs no Duke key and no VPN, and long conversations are not slowed by the Duke key's per-minute limit. It uses your own subscription's allowance. If you have no subscription, skip this section: the Duke key is the normal way.
+
+1. Do setup steps 1 to 6 above.
+2. Double-click "Use my Claude subscription" on the VM desktop. Chromium opens a Claude sign-in page: log in with the account that has your subscription and click Authorize. The window then says that Claude Code is signed in.
+3. Double-click "Check my setup" (checks 6 to 9 show N/A on this route), then "Start DFIR Lab" as usual.
+
+To go back to the Duke key, run `dfir-lab use duke` in a terminal; `dfir-lab use --status` shows which one is in use. Both your key and your sign-in stay on the VM. To sign the VM out of your Claude account, run `claude auth logout`.
 
 ## If something goes wrong
 
@@ -50,7 +60,7 @@ If copy and paste from your own computer into the VM does not work, open this pa
 
 ## Keep your key safe
 
-Your key is stored only inside the VM. It is not part of the problem report or of anything you submit.
+Your key is stored only inside the VM. It is not part of the problem report or of anything you submit. The same holds for your Claude sign-in if you use the subscription option.
 
 ## Credits
 

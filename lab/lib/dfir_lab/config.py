@@ -51,6 +51,15 @@ DEFAULTS = {
         # The AI-written report students audit (named in the start banner).
         "ai_report": "",
     },
+    # Optional route: the student's own Claude subscription instead of the gateway
+    # (dfir-lab use subscription). Nothing here is needed for the Duke route.
+    "subscription": {
+        # Claude Code model alias or ID for this route; "sonnet" is the current Sonnet.
+        "model": "sonnet",
+        # Hosts readiness check 5 connects to on this route: the API, the sign-in
+        # token service and the sign-in pages (seen in Claude Code 2.1.322).
+        "hosts": "https://api.anthropic.com https://platform.claude.com https://claude.ai",
+    },
     # The case's disk image (dfir-lab mount). An empty image means the case has none.
     "disk": {
         "image": "",
@@ -247,6 +256,29 @@ class Config:
                 )
             out[name] = value.strip()
         return out
+
+    # -- subscription route ---------------------------------------------
+    @property
+    def subscription_model(self):
+        value = self.get("subscription", "model") or "sonnet"
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._\[\]-]*$", value):
+            raise ConfigError(
+                "The setting [subscription] model in %s is not a model name: %r."
+                % (self.path, value),
+                "Tell the TA; the settings file needs to be fixed.")
+        return value
+
+    @property
+    def subscription_hosts(self):
+        hosts = self.get("subscription", "hosts").split()
+        # https:// in lab.conf; http:// is accepted for local tests.
+        bad = [h for h in hosts if not re.match(r"^https?://[^/\s]+$", h)]
+        if bad or not hosts:
+            raise ConfigError(
+                "The setting [subscription] hosts in %s must list web addresses, not %r."
+                % (self.path, " ".join(bad or hosts)),
+                "Tell the TA; the settings file needs to be fixed.")
+        return hosts
 
     # -- case -----------------------------------------------------------
     @property

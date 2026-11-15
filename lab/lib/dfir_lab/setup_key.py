@@ -2,7 +2,7 @@
 
 import sys
 
-from . import check, fsutil, keystore, ui
+from . import check, fsutil, keystore, route, ui
 from .errors import LabError, UsageError
 from .messages import CANNOT_REACH
 
@@ -45,7 +45,8 @@ def show_status():
 
 def test_key(cfg):
     """Run checks 5-7 and return (exit_code, headline, detail, todo)."""
-    ctx = check.run_checks(cfg, [4, 5, 6, 7])
+    # The key is always tested against the Duke gateway, whichever route is active.
+    ctx = check.run_checks(cfg, [4, 5, 6, 7], route=route.DUKE)
     r5, r6, r7 = ctx.results[5], ctx.results[6], ctx.results[7]
     model = cfg.model_main
     if r5.status == check.FAIL:
@@ -115,6 +116,10 @@ def run(cfg, from_stdin=False, clear=False, status=False):
             ui.out("What to do: " + todo)
     else:
         ui.out(detail)
-        ui.out("Next: double-click 'Start DFIR Lab' or run: dfir-lab start")
+        if route.is_subscription():
+            ui.out("Note: the lab uses your own Claude subscription right now. To use this key "
+                   "instead, run: dfir-lab use duke")
+        else:
+            ui.out("Next: double-click 'Start DFIR Lab' or run: dfir-lab start")
     ui.notify("Set up Duke AI access", headline + "\n\n" + (todo or detail), error=code != 0)
     return code

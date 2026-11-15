@@ -2,12 +2,15 @@
 """Claude Code PreToolUse hook for the CYBERSEC 510 DFIR lab.
 
 Blocks any tool call whose input mentions the key directory, the key file
-name, the key helper, or the key itself. Fails closed: input that cannot be
-understood is denied for Bash and for unknown tools.
+name, the key helper, or the key itself; and, for the optional subscription
+route, Claude Code's sign-in file (.credentials.json), `claude setup-token`
+(which prints a sign-in token), or the sign-in's token values. Fails closed:
+input that cannot be understood is denied for Bash and for unknown tools.
 
-This is a deterrent against the obvious, accidental read of the key, not a
-security boundary: Claude Code runs as the same user who owns the key, so an
-indirect shell command (a glob, a variable, a script) can still read it.
+This is a deterrent against the obvious, accidental read of the key or the
+sign-in, not a security boundary: Claude Code runs as the same user who owns
+both files, so an indirect shell command (a glob, a variable, a script) can
+still read them.
 
 Hook format verified against code.claude.com/docs/en/hooks on 2026-11-13:
 stdin JSON has tool_name and tool_input; a deny is
@@ -22,10 +25,10 @@ import json
 import os
 import sys
 
-REASON = ("Blocked by the DFIR lab: the student's Duke AI key and the files that hold it "
-          "are off limits. Do not try to read, print, copy, or locate the key, the "
-          "~/.config/dfir-lab directory, or the key helper. Continue the investigation "
-          "without them.")
+REASON = ("Blocked by the DFIR lab: the student's Duke AI key, their Claude sign-in, and the "
+          "files that hold them are off limits. Do not try to read, print, copy, or locate "
+          "the key, the ~/.config/dfir-lab directory, the key helper, or Claude Code's "
+          ".credentials.json. Continue the investigation without them.")
 REASON_MALFORMED = ("Blocked by the DFIR lab safety check: the tool request could not be "
                     "read, so it was refused. Try the command again in a simpler form.")
 
@@ -57,6 +60,34 @@ def stored_key():
         return ""
 
 
+def credentials_path():
+    """Claude Code's sign-in file: $CLAUDE_CONFIG_DIR/.credentials.json or
+    ~/.claude/.credentials.json (code.claude.com/docs/en/authentication)."""
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    return os.path.join(base, ".credentials.json")
+
+
+def _token_values(obj, out):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in ("accessToken", "refreshToken") and isinstance(v, str) and len(v) >= 16:
+                out.append(v)
+            else:
+                _token_values(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _token_values(v, out)
+    return out
+
+
+def sign_in_tokens():
+    try:
+        with open(credentials_path(), encoding="utf-8", errors="replace") as fh:
+            return _token_values(json.load(fh), [])
+    except (OSError, ValueError):
+        return []
+
+
 def needles():
     home = os.path.expanduser("~")
     here = os.path.dirname(os.path.abspath(__file__))
@@ -67,6 +98,9 @@ def needles():
         "key-helper",
         os.path.join(home, ".config", "dfir-lab").lower(),
         os.path.join(here, "key-helper").lower(),
+        # The subscription sign-in.
+        ".credentials.json",
+        "setup-token",
     ]
     return out
 
@@ -125,6 +159,9 @@ def main():
     key = stored_key()
     if key and len(key) >= 4:
         if key in blob or squash(key) in squash(blob):
+            deny(REASON)
+    for token in sign_in_tokens():
+        if token in blob or squash(token) in squash(blob):
             deny(REASON)
     allow()
 

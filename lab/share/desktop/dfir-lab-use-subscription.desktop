@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Use my Claude subscription
+Comment=Optional: use your own Claude subscription instead of a Duke key (signs you in)
+Exec=@BINDIR@/dfir-lab use subscription --pause
+Icon=user-info
+Terminal=true
+Categories=Education;

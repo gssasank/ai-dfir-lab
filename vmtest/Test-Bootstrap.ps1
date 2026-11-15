@@ -24,6 +24,14 @@
   7. Protocol SIFT reinstalled over our settings; `dfir-lab start` repairs them.
   8. Second clone without a kit: INCOMPLETE, non-zero, tells the student to
      download the kit; after adding the kit a rerun completes. Then --uninstall.
+  S. The optional subscription route without an account (nothing signs in): the "Use my
+     Claude subscription" shortcut and `dfir-lab use subscription` start Claude Code's own
+     sign-in and open Chromium; the settings drop the whole gateway lock and keep the rest;
+     `dfir-lab start` reaches the sign-in step with no gateway, theme or trust screen; the
+     route-aware check says "not signed in" and does not claim READY; `dfir-lab use duke`
+     restores the Duke settings exactly and all eleven checks pass again.
+  UP. Upgrade (mock runs by default): a third clone set up with the published 1.0.0 script,
+     with a key, checkpoint progress and notes, runs this setup; everything is kept.
   9. Timing, megabytes received by the guest, disk use.
   10. Logs to build\vmtest\<RunName>\; clones deleted in all cases unless -KeepVm.
 
@@ -43,8 +51,8 @@
 #>
 param(
     # bootstrap-<x> for mock runs, gw-<x> for runs against the real gateway, rc-<x> for
-    # release-candidate runs (either gateway).
-    [ValidatePattern('^(bootstrap|gw|rc)-[A-Za-z0-9._-]{1,40}$')]
+    # release-candidate runs (either gateway), sub-<x> for subscription-route work.
+    [ValidatePattern('^(bootstrap|gw|rc|sub)-[A-Za-z0-9._-]{1,40}$')]
     [string]$RunName = ('bootstrap-' + (Get-Date -Format 'MMdd-HHmmss')),
     [ValidateSet('mock', 'real')][string]$Gateway = 'mock',
     [string]$KeyFile,
@@ -59,6 +67,18 @@ param(
     [switch]$KeepVm,
     [switch]$NoBuild,
     [switch]$SkipNegative,
+    # Upgrade test (step UP: 1.0.0 setup, then this setup, on a third clone). Default: on for
+    # mock runs, off for real-gateway runs (it does not use the gateway).
+    [switch]$SkipUpgrade,
+    [switch]$Upgrade,
+    # The 1.0.0 release the upgrade starts from (git commit of the published script).
+    [string]$UpgradeFromCommit = 'd5fac5a',
+    # Skip the updater-dialog watch (step U and its 11-minute wait).
+    [switch]$SkipUpdaterWatch,
+    # Only what the subscription route can affect: steps 0, 1, 2, 3, S and UP (implies
+    # -SkipUpdaterWatch and -SkipNegative; the first clone is removed before step UP, so
+    # one test VM runs at a time). Every other step is reported as SKIPPED, not PASS.
+    [switch]$SubscriptionOnly,
     [string]$HostAddress = '192.168.172.1',
     [int]$Port = 8471,
     [int]$BootstrapTimeoutSec = 2700
@@ -87,6 +107,14 @@ $MockDir = '/var/tmp/dfir-mock'      # survives the reboot test (/tmp is cleared
 $ServeDir = if ($Gateway -eq 'mock') { Join-Path $Repo 'build\bootstrap\test-dist' } else { Join-Path $Repo 'dist' }
 $VmA = "$RunName-a"
 $VmB = "$RunName-b"
+$VmC = "$RunName-c"
+$DoUpgrade = if ($SkipUpgrade) { $false } elseif ($Upgrade) { $true } else { $Gateway -eq 'mock' }
+$OnlySteps = $null
+if ($SubscriptionOnly) {
+    $OnlySteps = @('0', '1', '2', '3', 'S', 'UP')
+    $SkipUpdaterWatch = $true
+    $SkipNegative = $true
+}
 $Created = [System.Collections.Generic.List[string]]::new()
 $Results = [System.Collections.Generic.List[object]]::new()
 $Secret = $null
@@ -162,6 +190,11 @@ function Check([bool]$Cond, [string]$What) {
 
 function Invoke-Step([string]$Id, [string]$Title, [scriptblock]$Body, [switch]$Critical) {
     Say ''
+    if (($OnlySteps -and $Id -notin $OnlySteps) -or ($SkipUpdaterWatch -and $Id -eq 'U')) {
+        Say "=== Step $Id`: ${Title}: SKIPPED (not run in this mode) ===" 'Yellow'
+        $Results.Add([pscustomobject]@{ Step = $Id; Title = $Title; Status = 'SKIPPED'; Seconds = 0; Error = '' })
+        return
+    }
     Say "=== Step $Id`: $Title ===" 'Cyan'
     $script:StepFailures = 0
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -226,7 +259,7 @@ function New-Clone([string]$Name) {
     Say "  $Name ready after $($r.ReadySeconds) s"
     $r2 = G $Name "mkdir -p $GuestDir && chmod 755 $GuestDir && echo ok"
     if ($r2.Rc -ne 0) { throw "guest not usable: $($r2.Text)" }
-    foreach ($f in 'start-bootstrap.sh', 'installed-listing.sh', 'first-start-pty.py', 'pty-run.py', 'watch-updaters.sh') {
+    foreach ($f in 'start-bootstrap.sh', 'installed-listing.sh', 'first-start-pty.py', 'pty-run.py', 'watch-updaters.sh', 'sub-route-pty.py') {
         ToGuest $Name (Join-Path $PSScriptRoot "guest\$f") "$GuestDir/$f" -Lf
     }
     # The disk image reaches the guest through a READ-ONLY shared folder (host side
@@ -259,16 +292,18 @@ function Put-Image([string]$Vm) {
     Say "  $Vm`: $($c.Text)"
 }
 
-function Invoke-OneLiner([string]$Vm, [string]$Tag, [string]$ExtraArgs = '', [switch]$Pty, $KitUrl = $null) {
+function Invoke-OneLiner([string]$Vm, [string]$Tag, [string]$ExtraArgs = '', [switch]$Pty, $KitUrl = $null,
+                         [string]$Command = '') {
     # Runs the student command in the guest and waits for it. Returns a result object.
     # -ExtraArgs is appended to "bash bootstrap.sh"; -Pty runs it in a pseudo-terminal
-    # that answers [Y/n] questions with y (stdin is /dev/null otherwise).
+    # that answers [Y/n] questions with y (stdin is /dev/null otherwise). -Command
+    # replaces the student command (the upgrade test runs the 1.0.0 one first).
     $gout = "$GuestDir/$Tag"
     $local = Join-Path $TmpDir "command-$Tag.txt"
     # The kit download URL is the test-only override DFIR_LAB_KIT_URL (the real
     # GitHub URL answers 404 while the repository is private).
     if ($null -eq $KitUrl) { $KitUrl = $script:KitUrl }
-    $cmd = $script:StudentCommand
+    $cmd = if ($Command) { $Command } else { $script:StudentCommand }
     if ($KitUrl) { $cmd = $cmd.Replace('&& bash bootstrap.sh', "&& DFIR_LAB_KIT_URL=$KitUrl bash bootstrap.sh") }
     [IO.File]::WriteAllText($local, ($cmd + $(if ($ExtraArgs) { " $ExtraArgs" } else { '' })) + "`n")
     $null = G $Vm "mkdir -p $gout"
@@ -379,9 +414,24 @@ try {
         Check ((Get-Item -LiteralPath $ImageHost).Length -eq 4836649413) "disk image zip exists with the expected size ($ImageHost)"
         # The kit is served next to the script, as GitHub will serve it from the release;
         # /kit/not-the-kit.zip is a file with the wrong SHA-256, for the mismatch test.
-        $script:Server = Start-FileServer $HostAddress $Port @{ '/dist/bootstrap.sh' = (Join-Path $ServeDir 'bootstrap.sh')
-                                                               "/kit/$KitName" = $KitHost
-                                                               '/kit/not-the-kit.zip' = (Join-Path $ServeDir 'bootstrap.sh.sha256') }
+        $files = @{ '/dist/bootstrap.sh' = (Join-Path $ServeDir 'bootstrap.sh')
+                    "/kit/$KitName" = $KitHost
+                    '/kit/not-the-kit.zip' = (Join-Path $ServeDir 'bootstrap.sh.sha256') }
+        if ($DoUpgrade) {
+            # Upgrade test: the published 1.0.0 script (from git) and the real kit it accepts.
+            $old = Join-Path $OutDir 'bootstrap-1.0.0.sh'
+            $wslOld = '/mnt/' + $old.Substring(0, 1).ToLower() + ($old.Substring(2) -replace '\\', '/')
+            $g = wsl.exe -d Ubuntu -- bash -c ("cd '$wslRepo' && git -c safe.directory='*' show $UpgradeFromCommit`:dist/bootstrap.sh > '$wslOld' && " +
+                                               "git -c safe.directory='*' show $UpgradeFromCommit`:dist/bootstrap.sh.sha256") 2>&1 | Out-String
+            $script:OldSha = ($g.Trim() -split '\s+')[0]
+            $oldActual = (Get-FileHash -Algorithm SHA256 -LiteralPath $old).Hash.ToLower()
+            Check ($oldActual -eq $script:OldSha) "1.0.0 script from git $UpgradeFromCommit matches its published SHA-256 ($oldActual)"
+            $files['/dist-1.0.0/bootstrap.sh'] = $old
+            $files['/kit-real/szechuan-kit-0.1.0.zip'] = (Join-Path $Repo 'kit\szechuan-kit-0.1.0.zip')
+            $script:OldCommand = "curl -fsSLO http://$HostAddress`:$Port/dist-1.0.0/bootstrap.sh && echo `"$($script:OldSha)  bootstrap.sh`" | sha256sum -c && bash bootstrap.sh"
+            $script:RealKitUrl = "http://$HostAddress`:$Port/kit-real/szechuan-kit-0.1.0.zip"
+        }
+        $script:Server = Start-FileServer $HostAddress $Port $files
         $script:KitUrl = "http://$HostAddress`:$Port/kit/$KitName"
         Say "  serving the kit at $($script:KitUrl) (DFIR_LAB_KIT_URL)"
         $script:StudentCommand = "curl -fsSLO http://$HostAddress`:$Port/dist/bootstrap.sh && echo `"$($script:Sha)  bootstrap.sh`" | sha256sum -c && bash bootstrap.sh"
@@ -395,6 +445,7 @@ try {
         $script:Run1 = Invoke-OneLiner $VmA 'run1'
         # Watch the desktop for updater windows from now on (evaluated in step U).
         $script:WatchStart = Get-Date
+        if ($SkipUpdaterWatch) { Say '  updater watch: SKIPPED (-SkipUpdaterWatch)' 'Yellow'; return }
         $w = G $VmA ("export XDG_RUNTIME_DIR=/run/user/`$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/`$(id -u)/bus; " +
                      "mkdir -p /var/tmp/dfir-watch && systemd-run --user --collect --quiet --unit=dfir-watch-updaters " +
                      "bash $GuestDir/watch-updaters.sh $UpdaterWatchSec /var/tmp/dfir-watch/updaters.log && echo started")
@@ -414,6 +465,7 @@ try {
         Check ($script:Run1.Screen -match 'kept /home/sansforensics/Downloads/DC01-E01\.zip') 'without a terminal to ask, the zip is kept and the student is told'
         Check ($script:Run1.Screen -match 'passed: Case files: .*disk image: 3 files match their SHA-256, mounted read-only and noexec at /mnt/dc01') 'check 3 verified, mounted and read the image'
         Check ($script:Run1.Screen -match 'Disk image\s+DC01\.E01') 'summary lists the disk image'
+        Check ($script:Run1.Screen -match 'Optional: if you already pay for Claude \(Pro or Max\), you can use it instead of a Duke key; see the README\.') 'one line at the end mentions the optional subscription route'
         $rp = G $VmA 'dfir-lab replay --list --no-gui; echo "rc=$?"; ls /cases/szechuan/ticket.md /cases/szechuan/ai-report.md /cases/szechuan/CLAUDE.md'
         Say ($rp.Text -replace '(?m)^', '    ')
         Check ($rp.Text -match 'szechuan-cp3-cp6' -and $rp.Text -match 'rc=0') 'the offline replay lists the recorded session'
@@ -695,7 +747,7 @@ pgrep -af 'dfir-lab check' | head -n 3
 pgrep -af gnome-terminal | head -n 3
 '@ -Save "$VmA\desktop-evidence.txt"
         Say ($g.Text -replace '(?m)^', '    ')
-        Check (($g.Text -split "`n" | Where-Object { $_ -match 'metadata::trusted: true' }).Count -eq 4) 'all four shortcuts: trusted, x-desktop, executable'
+        Check (($g.Text -split "`n" | Where-Object { $_ -match 'metadata::trusted: true' }).Count -eq 5) 'all five shortcuts (with "Use my Claude subscription"): trusted, x-desktop, executable'
         Check ($g.Text -match 'dfir-lab check --pause') 'launching the "Check my setup" shortcut started dfir-lab check in a terminal'
         Check ($g.Text -match 'Default application for .x-scheme-handler/https.: chromium_chromium\.desktop') 'GIO opens https links with Chromium'
         Check ($g.Text -match 'mimeapps https=chromium_chromium\.desktop') 'Chromium is the explicit default in ~/.config/mimeapps.list'
@@ -703,6 +755,111 @@ pgrep -af gnome-terminal | head -n 3
         $shot2 = Join-Path $OutDir "$VmA\desktop-shortcut-launched.png"
         $null = Invoke-Vmrun -Guest captureScreen (Resolve-Vmx $VmA) $shot2
         $null = G $VmA "pkill -f 'dfir-lab check --pause'; true"
+    }
+
+    Invoke-Step 'S' 'Subscription route up to the sign-in (no account), then back to a working Duke route' {
+        # Nothing here signs in: there is no account, and ~/.claude/.credentials.json must
+        # stay absent. Every guest text goes through Protect (the key) and sub-route-pty.py
+        # masks anything shaped like an Anthropic credential.
+        $pre = G $VmA ("jq -S . ~/.claude/settings.json > $GuestDir/settings-duke-before.json && " +
+                       "sha256sum ~/.config/dfir-lab/duke-api-key | cut -c1-64")
+        $keyHash = ($pre.Text -split "`n")[-1].Trim()
+        # a) The desktop shortcut, launched the way the desktop does (GLib): it starts
+        #    `dfir-lab use subscription` in a terminal, which opens Chromium at the sign-in page.
+        $sc = G $VmA @'
+export XDG_RUNTIME_DIR=/run/user/$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus WAYLAND_DISPLAY=wayland-0 DISPLAY=:0
+export XDG_DATA_DIRS=/usr/share/ubuntu:/usr/share/gnome:/usr/local/share/:/usr/share/:/var/lib/snapd/desktop
+# The session's display variables, XAUTHORITY included (Chromium needs it under Xwayland).
+eval "$(systemctl --user show-environment | grep -E '^(XAUTHORITY|DISPLAY|WAYLAND_DISPLAY)=' | sed 's/^/export /')"
+grep -E '^(Name|Exec)=' ~/Desktop/dfir-lab-use-subscription.desktop
+gio launch ~/Desktop/dfir-lab-use-subscription.desktop &
+sleep 30
+pgrep -af 'dfir-lab use subscription' | head -n 2
+echo "chromium-sign-in-page: $(pgrep -af chrom | grep -c 'oauth/authorize')"
+pkill -f 'dfir-lab use subscription'; pkill -f 'claude auth login'; pkill -f 'oauth/authorize'; sleep 2; pkill -f /snap/chromium/; true
+'@ -Timeout 300 -Save "$VmA\sub-shortcut.txt"
+        Say ($sc.Text -replace 'https://\S+', '<link>' -replace '(?m)^', '    ')
+        Check ($sc.Text -match 'Name=Use my Claude subscription' -and $sc.Text -match 'dfir-lab use subscription --pause') 'double-clicking "Use my Claude subscription" runs dfir-lab use subscription in a terminal'
+        Check ($sc.Text -match 'chromium-sign-in-page: [1-9]') 'it opened Chromium at the Claude sign-in page'
+        # b) The command in a pseudo-terminal: what the student reads, Claude Code's own sign-in.
+        $u = G $VmA "python3 $GuestDir/sub-route-pty.py use $GuestDir/sub" -Timeout 400 -Save "$VmA\sub-use.txt"
+        $null = FromGuest $VmA "$GuestDir/sub/use-screen.txt" (Join-Path $OutDir "$VmA\sub-use-screen.txt")
+        Say ($u.Text -replace '(?m)^', '    ')
+        Check ($u.Rc -eq 0) 'dfir-lab use subscription: explains the route and the sign-in, starts Claude Code''s own sign-in, opens Chromium, prints the link and the paste prompt'
+        # c) Settings and state after switching.
+        $s = G $VmA @'
+jq -r '
+  "no_api_key_helper=\(has("apiKeyHelper") | not)",
+  "no_base_url=\(.env | has("ANTHROPIC_BASE_URL") | not)",
+  "no_is_demo=\(.env | has("IS_DEMO") | not)",
+  "no_forced_effort=\(.env | has("CLAUDE_CODE_EFFORT_LEVEL") | not)",
+  "no_api_key_variables=\((.env | has("ANTHROPIC_API_KEY") | not) and (.env | has("ANTHROPIC_AUTH_TOKEN") | not))",
+  "no_gateway_models=\([.env | keys[] | select(startswith("ANTHROPIC_DEFAULT_") or . == "CLAUDE_CODE_SUBAGENT_MODEL")] | length == 0)",
+  "model_sonnet=\(.env.ANTHROPIC_MODEL == "sonnet")",
+  "tools_restricted=\(.env.CLAUDE_CODE_DISABLE_WORKFLOWS == "1" and ((.permissions.deny // []) | index("Agent") != null))",
+  "guard_hook=\([.hooks.PreToolUse[]?.hooks[]?.command] | any(contains("pretool-guard")))",
+  "deny_key_dir=\((.permissions.deny // []) | index("Read(~/.config/dfir-lab/**)") != null)",
+  "deny_sign_in_file=\((.permissions.deny // []) | index("Read(~/.claude/.credentials.json)") != null)",
+  "psift_stop_hook=\([.hooks.Stop[]?.hooks[]?.command] | any(contains("forensic_audit.log")))",
+  "psift_default_mode=\(.permissions.defaultMode == "acceptEdits")"' ~/.claude/settings.json
+echo "route_subscription=$([ "$(jq -r .route ~/dfir-lab/route.json)" = subscription ] && echo true || echo false)"
+echo "onboarding_seeded=$(jq -r '.hasCompletedOnboarding == true' ~/.claude.json)"
+echo "trust_seeded=$(jq -r '.projects["/cases/szechuan"].hasTrustDialogAccepted == true' ~/.claude.json)"
+echo "no_sign_in_file=$([ -e ~/.claude/.credentials.json ] && echo false || echo true)"
+echo "key=$(sha256sum ~/.config/dfir-lab/duke-api-key | cut -c1-64)"
+dfir-lab use --status --no-gui
+'@ -Save "$VmA\sub-settings.txt"
+        Say ($s.Text -replace '(?m)^', '    ')
+        Check ($s.Text -notmatch '=false') 'settings: no gateway URL, credential helper, IS_DEMO, forced effort or API-key variables; Sonnet; tool restrictions, guard, deny rules and Protocol SIFT''s entries kept; route stored; first-run screens seeded'
+        Check ($s.Text -match "key=$keyHash") 'the stored Duke key was not touched'
+        Check ($s.Text -match 'AI access: your own Claude subscription\.' -and $s.Text -match 'Claude sign-in: not signed in\.') 'dfir-lab use --status: subscription route, not signed in'
+        # d) dfir-lab start in a pseudo-terminal reaches Claude Code's own sign-in.
+        $st = G $VmA "python3 $GuestDir/sub-route-pty.py start $GuestDir/sub" -Timeout 400 -Save "$VmA\sub-start.txt"
+        $null = FromGuest $VmA "$GuestDir/sub/start-screen.txt" (Join-Path $OutDir "$VmA\sub-start-screen.txt")
+        Say ($st.Text -replace '(?m)^', '    ')
+        Check ($st.Rc -eq 0) 'dfir-lab start (not signed in): offers the sign-in and reaches Claude Code''s sign-in step; no error, no gateway, no theme picker, no trust question; Chromium opened'
+        # e) The program start runs: interactive Claude Code, no first-run screen, "Not logged in".
+        $cl = G $VmA "python3 $GuestDir/sub-route-pty.py claude $GuestDir/sub" -Timeout 300 -Save "$VmA\sub-claude.txt"
+        $null = FromGuest $VmA "$GuestDir/sub/claude-screen.txt" (Join-Path $OutDir "$VmA\sub-claude-screen.txt")
+        Say ($cl.Text -replace '(?m)^', '    ')
+        Check ($cl.Rc -eq 0) 'interactive Claude Code on the subscription route: Sonnet, no theme or trust screen, a message gets "Not logged in"'
+        # f) The route-aware readiness check: not signed in, READY not claimed.
+        $c = G $VmA "dfir-lab check --json --no-gui > $GuestDir/sub-check.json; echo rc=`$?; cat $GuestDir/sub-check.json" -Timeout 600 -Save "$VmA\sub-check.txt"
+        $json = $null
+        try { $json = ($c.Text.Substring($c.Text.IndexOf('{'))) | ConvertFrom-Json } catch { }
+        Check ($null -ne $json) 'check printed JSON'
+        if ($json) {
+            foreach ($r in $json.results) { Say ("    {0,2} {1,-17} {2,-4} {3}" -f $r.id, $r.name, $r.status, $r.result) }
+            $st2 = @{}; foreach ($r in $json.results) { $st2[[int]$r.id] = $r }
+            Check ($json.route -eq 'subscription') 'the check names the subscription route'
+            Check ((1, 2, 3, 5, 11 | Where-Object { $st2[$_].status -ne 'PASS' }).Count -eq 0) 'system, tools, case files and disk image, Anthropic reachable without VPN, results: PASS'
+            Check ($st2[4].status -eq 'FAIL' -and $st2[4].result -match 'not signed in with your Claude subscription') 'check 4 says "not signed in"'
+            Check ((6, 7, 8, 9 | Where-Object { $st2[$_].status -ne 'NA' }).Count -eq 0) 'checks 6-9 are not applicable (NA), not failures'
+            Check ($st2[10].status -eq 'SKIP') 'the Claude Code task waits for the sign-in'
+            Check ($json.ready -eq $false -and $json.code -match '-NS-[0-9a-f]{10}$') "READY is not claimed (code $($json.code))"
+        }
+        $rp = G $VmA 'dfir-lab report-problem --no-gui > /dev/null; f=$(ls -t ~/dfir-lab/problem-report-*.txt | head -n 1); grep -E "AI access route|Claude sign-in" "$f"; grep -c "sk-ant-" "$f"'
+        Say ($rp.Text -replace '(?m)^', '    ')
+        Check ($rp.Text -match 'AI access route: own Claude subscription' -and $rp.Text -match '(?m)^0$') 'problem report names the route and holds no credential'
+        # g) Back to the Duke route: the same settings as before, and every check passes.
+        $d = G $VmA @'
+dfir-lab use duke --no-gui; echo "use-duke=$?"
+jq -S . ~/.claude/settings.json > /tmp/dfir-test/settings-duke-after.json
+cmp -s /tmp/dfir-test/settings-duke-before.json /tmp/dfir-test/settings-duke-after.json && echo settings-identical || diff /tmp/dfir-test/settings-duke-before.json /tmp/dfir-test/settings-duke-after.json | head -n 20
+echo "route=$(jq -r .route ~/dfir-lab/route.json)"
+dfir-lab use duke --no-gui | head -n 1
+'@ -Save "$VmA\sub-back-to-duke.txt"
+        Say ($d.Text -replace '(?m)^', '    ')
+        Check ($d.Text -match 'use-duke=0' -and $d.Text -match 'route=duke') 'dfir-lab use duke switched back'
+        Check ($d.Text -match 'settings-identical') 'the Duke settings are exactly what they were before switching'
+        Check ($d.Text -match 'already uses your Duke AI Gateway key') 'switching again changes nothing'
+        $s2 = Jq-Settings $VmA $script:BaseUrl "$VmA\sub-settings-duke-again.txt"
+        Check ($s2.Text -notmatch '=false') 'Duke settings complete (helper, gateway URL, Haiku, low effort, IS_DEMO, guard, deny rules, Protocol SIFT)'
+        $c2 = G $VmA "dfir-lab check --json --no-gui > $GuestDir/duke-again.json; echo rc=`$?; cat $GuestDir/duke-again.json" -Timeout 600 -Save "$VmA\sub-duke-check.txt"
+        $j2 = $null
+        try { $j2 = ($c2.Text.Substring($c2.Text.IndexOf('{'))) | ConvertFrom-Json } catch { }
+        if ($j2) { foreach ($r in $j2.results) { Say ("    {0,2} {1,-17} {2,-4} {3}" -f $r.id, $r.name, $r.status, $r.result) } }
+        Check ($null -ne $j2 -and $j2.results.Count -eq 11 -and @($j2.results | Where-Object status -ne 'PASS').Count -eq 0 -and $j2.ready -eq $true -and $j2.route -eq 'duke') "after switching back all eleven checks pass on the Duke route ($Gateway gateway), code $($j2.code)"
     }
 
     Invoke-Step '9' 'Timing, download size, disk use' {
@@ -790,6 +947,69 @@ for p in /cases/szechuan ~/.local/bin/claude ~/.claude ~/dfir-lab; do [ -e "$p" 
         }
     }
 
+    if ($DoUpgrade) {
+        Invoke-Step 'UP' "Upgrade: a VM set up with 1.0.0 ($UpgradeFromCommit) runs this setup; key, disk image, progress and notes kept" {
+            # At most two test VMs run at once (host memory): the second clone is done by now.
+            if ($SubscriptionOnly -and -not $KeepVm -and $Created.Contains($VmA)) {
+                # Steps U and R are not run in this mode, so the first clone is done.
+                try { Collect $VmA } catch { }
+                try { $null = & (Join-Path $PSScriptRoot 'Remove-TestVm.ps1') -Vm $VmA; $null = $Created.Remove($VmA); Say "  removed clone $VmA (done)" }
+                catch { Say "  could not remove $VmA`: $_" 'DarkYellow' }
+            }
+            if (-not $KeepVm -and $Created.Contains($VmB)) {
+                try { $null = & (Join-Path $PSScriptRoot 'Remove-TestVm.ps1') -Vm $VmB; $null = $Created.Remove($VmB); Say "  removed clone $VmB (done)" }
+                catch { Say "  could not remove $VmB`: $_" 'DarkYellow' }
+            }
+            New-Clone $VmC
+            Put-Image $VmC
+            $v1 = Invoke-OneLiner $VmC 'v100' -Command $script:OldCommand -KitUrl $script:RealKitUrl
+            Check ($v1.Rc -eq 0 -and $v1.Screen -match 'SETUP COMPLETE' -and $v1.Screen -match 'dfir-lab 1\.0\.0 installed') "the 1.0.0 setup completed (exit $($v1.Rc))"
+            # The student's state under 1.0.0: a key, checkpoint progress, notes.
+            $st = G $VmC @'
+set -u
+umask 077; printf 'sk-upgrade-test-%s\n' "$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')" > /tmp/dfir-test/k; umask 022
+dfir-lab setup-key --from-stdin --no-gui < /tmp/dfir-test/k > /dev/null 2>&1; shred -u /tmp/dfir-test/k
+dfir-lab hint 1 --no-gui > /dev/null; dfir-lab checkpoint 1 1 --no-gui > /dev/null
+echo "my notes" > /cases/szechuan/analysis/my-notes.txt
+echo "version=$(dfir-lab version)"
+for f in ~/.config/dfir-lab/duke-api-key ~/dfir-lab/progress.json /cases/szechuan/analysis/my-notes.txt; do echo "sum $(sha256sum "$f" | cut -c1-64) $f"; done
+stat -c 'disk %i %Y %a %U %n' /cases/szechuan/disk/20200918_0347_CDrive.E01 /cases/szechuan/disk/20200918_0347_CDrive.E02
+'@ -Save "$VmC\upgrade-before.txt"
+            Say ($st.Text -replace '(?m)^', '    ')
+            Check ($st.Text -match 'lab version 1\.0\.0') 'the toolkit reports lab version 1.0.0 before the upgrade'
+            $v2 = Invoke-OneLiner $VmC 'v110' -KitUrl $script:RealKitUrl
+            Check ($v2.Rc -eq 0 -and $v2.Screen -match 'SETUP COMPLETE') "the new setup on the 1.0.0 VM: SETUP COMPLETE (exit $($v2.Rc))"
+            Check ($v2.Screen -match 'dfir-lab 1\.1\.0 installed') 'the toolkit was upgraded to 1.1.0'
+            Check ($v2.Screen -match 'already done: the disk image is in /cases/szechuan/disk \(3 files verified, read-only\)') 'the unpacked disk image was verified and kept (not unpacked again)'
+            Check ($v2.Screen -match 'already done: case szechuan is installed') 'the case files were kept'
+            Check ($v2.Screen -match 'passed: Duke AI key: stored') 'the stored key is still there'
+            Check ($v2.Screen -match 'Optional: if you already pay for Claude') 'the optional-route line is shown'
+            $af = G $VmC @'
+echo "version=$(dfir-lab version)"
+for f in ~/.config/dfir-lab/duke-api-key ~/dfir-lab/progress.json /cases/szechuan/analysis/my-notes.txt; do echo "sum $(sha256sum "$f" | cut -c1-64) $f"; done
+stat -c 'disk %i %Y %a %U %n' /cases/szechuan/disk/20200918_0347_CDrive.E01 /cases/szechuan/disk/20200918_0347_CDrive.E02
+echo "key-mode=$(stat -c %a ~/.config/dfir-lab/duke-api-key)"
+echo "route-file=$([ -e ~/dfir-lab/route.json ] && echo present || echo absent)"
+sed -n '/^\[subscription\]/,/^\[case\]/p' /etc/dfir-lab/lab.conf | grep '^model'
+jq -r '"helper=\(.apiKeyHelper // "none")", "base_url=\(.env.ANTHROPIC_BASE_URL // "none")", "deny_sign_in=\((.permissions.deny // []) | index("Read(~/.claude/.credentials.json)") != null)"' ~/.claude/settings.json
+export XDG_RUNTIME_DIR=/run/user/$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus
+echo "new-shortcut-trusted=$(gio info -a metadata::trusted ~/Desktop/dfir-lab-use-subscription.desktop 2>/dev/null | grep -c 'trusted: true')"
+dfir-lab use --status --no-gui | head -n 2
+dfir-lab progress --no-gui | sed -n '3,4p'
+'@ -Save "$VmC\upgrade-after.txt"
+            Say ($af.Text -replace '(?m)^', '    ')
+            $before = @($st.Text -split "`n" | Where-Object { $_ -match '^(sum|disk) ' })
+            $after = @($af.Text -split "`n" | Where-Object { $_ -match '^(sum|disk) ' })
+            Check ($before.Count -eq 5 -and (($before -join "`n") -eq ($after -join "`n"))) 'key, progress, notes and disk image files are byte-for-byte and inode-for-inode unchanged'
+            Check ($af.Text -match 'lab version 1\.1\.0' -and $af.Text -match 'model = sonnet') 'lab.conf is 1.1.0 with the [subscription] section'
+            Check ($af.Text -match 'key-mode=600' -and $af.Text -match 'route-file=absent') 'key still private; no route chosen, so the Duke route stays'
+            Check ($af.Text -match 'helper=\S*key-helper' -and $af.Text -match 'base_url=http' -and $af.Text -match 'deny_sign_in=true') 'Claude Code settings: still the Duke route, now with the sign-in deny rules'
+            Check ($af.Text -match 'new-shortcut-trusted=1') 'the new "Use my Claude subscription" shortcut is installed and trusted'
+            Check ($af.Text -match 'AI access: your Duke AI Gateway key\.') 'dfir-lab use --status: Duke route'
+            Check ($af.Text -match '(?m)^1\s.*\s-\s+1\s+1/') 'checkpoint progress (1 attempt, 1 hint) survived'
+        }
+    }
+
     Invoke-Step 'U' "No updater window for $UpdaterWatchSec s after the setup; release-upgrade prompt off" {
         $left = $UpdaterWatchSec + 20 - ((Get-Date) - $script:WatchStart).TotalSeconds
         if ($left -gt 0) { Say "    waiting $([int]$left) s more for the watch to finish"; Start-Sleep -Seconds ([int]$left) }
@@ -836,7 +1056,7 @@ echo "table: $(findmnt -rn -o FSTYPE,VFS-OPTIONS --mountpoint /mnt/dc01)"
         Check ($r.Text -match 'Incident ticket: /cases/szechuan/ticket\.md' -and $r.Text -match 'AI report to check \(worksheet Section C\): /cases/szechuan/ai-report\.md' -and $r.Text -match '/clear') 'start shows the ticket, the AI report and the /clear reminder'
         Check ($r.Text -match 'status-after=0' -and $r.Text -match 'table: fuseblk \S*noexec') 'mounted read-only and noexec again'
     }
-    $overall = if (@($Results | Where-Object Status -ne 'PASS').Count -eq 0) { 'PASS' } else { 'FAIL' }
+    $overall = if (@($Results | Where-Object { $_.Status -notin 'PASS', 'SKIPPED' }).Count -eq 0) { 'PASS' } else { 'FAIL' }
 }
 catch {
     Say "ABORTED: $(Protect $_.Exception.Message)" 'Red'

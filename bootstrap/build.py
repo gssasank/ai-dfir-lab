@@ -127,6 +127,10 @@ def read_release(path):
                          "(64 lowercase hex), got %r. Build the stand-in kit with "
                          "`build.py standin-kit` and paste its hash, or paste the real kit's."
                          % values["CASE_KIT_SHA256"])
+    values.setdefault("SUBSCRIPTION_MODEL", "sonnet")
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", values["SUBSCRIPTION_MODEL"]):
+        raise BuildError("release.conf: SUBSCRIPTION_MODEL=%r does not look like a model name"
+                         % values["SUBSCRIPTION_MODEL"])
     values.setdefault("CLAUDE_EFFORT", "")
     if values["CLAUDE_EFFORT"] not in ("", "low", "medium", "high", "xhigh", "max", "auto"):
         raise BuildError("release.conf: CLAUDE_EFFORT must be low, medium, high, xhigh, max, "
@@ -192,6 +196,7 @@ def payload_members(rel):
 
     tpl = (HERE / "lab.conf.in").read_text(encoding="utf-8")
     for key in ("VERSION", "GATEWAY_BASE_URL", "MODEL_MAIN", "MODEL_SMALL", "CLAUDE_EFFORT",
+                "SUBSCRIPTION_MODEL",
                 "CASE_ID", "CASE_TITLE", "IMAGE_SHORT_NAME_LOWER", "IMAGE_SHORT_NAME",
                 "IMAGE_FILES", "IMAGE_MOUNT_POINT", "IMAGE_ZIP_NAME"):
         tpl = tpl.replace("@%s@" % key, rel[key])

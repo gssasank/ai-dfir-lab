@@ -162,6 +162,45 @@ OUTCOMES = {
         "cause (HTTP {status}). The gateway said: {body}",
         "Try again in a minute. If it keeps happening, {contact} and include this message.",
     ),
+    # --- the optional subscription route (dfir-lab use subscription) ----
+    # Formats Claude Code prints are listed in subscription.py.
+    "sub_not_signed_in": (
+        "Claude Code is not signed in with your Claude subscription yet.",
+        "Sign in: double-click \"Use my Claude subscription\" on the desktop, or run  "
+        "dfir-lab use subscription . To use your Duke key instead, run  dfir-lab use duke .",
+    ),
+    "sub_wrong_login": (
+        "Claude Code is {detail}.",
+        "Run  dfir-lab use subscription  and sign in with the Claude account that has your "
+        "subscription (choose the subscription, not the Console). To use your Duke key "
+        "instead, run  dfir-lab use duke .",
+    ),
+    "sub_login_expired": (
+        "Your Claude sign-in has expired or is no longer accepted, so Claude Code cannot use "
+        "your subscription. Claude Code said: {detail}",
+        "Sign in again: run  dfir-lab use subscription . To use your Duke key instead, run  "
+        "dfir-lab use duke .",
+    ),
+    "sub_usage_limit": (
+        "Your Claude subscription has reached its usage limit for now. Claude Code said: "
+        "{detail}",
+        "Wait until the time Claude Code gives and try again (in Claude Code, /usage shows your "
+        "limits), or switch to your Duke key with one command:  dfir-lab use duke  (off "
+        "campus it needs the Duke VPN).",
+    ),
+    "sub_no_network": (
+        "Cannot reach Anthropic's service: {host} {reason}{detail_paren}. This is a network "
+        "problem, not a problem with your Claude sign-in.",
+        "Check that the VM has internet access: open any web page in Chromium inside the VM. "
+        "This route needs no VPN; if a VPN, a firewall, or a hotel or company network blocks "
+        "it, try another network. If it still fails, {contact}.",
+    ),
+    "sub_busy": (
+        "Anthropic's service is busy or briefly unavailable. Claude Code said: {detail}",
+        "Wait a few minutes and try again; Claude Code also retries by itself. If it keeps "
+        "happening, see https://status.claude.com, or switch to your Duke key:  "
+        "dfir-lab use duke .",
+    ),
 }
 
 CANNOT_REACH = {"dns", "timeout", "refused", "unreachable", "cert", "tls"}
@@ -176,7 +215,7 @@ def render(kind, cfg=None, **fields):
         "timeout": 8.0, "rtimeout": 60.0, "similar": "", "retry": "",
         "per_minute": "a limited number of requests and tokens per minute", "counted": "",
         "budget": "", "per_minute_paren": "",
-        "hint": "", "dashboard": "",
+        "hint": "", "dashboard": "", "reason": "", "detail_paren": "",
         "contact": contact,
         "contact_cap": contact[:1].upper() + contact[1:],
     }
@@ -197,6 +236,8 @@ def render(kind, cfg=None, **fields):
         values["body"] = " ".join(redact(str(values["body"])).split())[:300]
     if values.get("detail"):
         values["detail"] = redact(str(values["detail"]))
+        if kind == "sub_no_network":
+            values["detail_paren"] = " (%s)" % values["detail"]
     if values.get("retry"):
         values["retry"] = " The gateway says to retry after %s seconds." % values["retry"]
     try:

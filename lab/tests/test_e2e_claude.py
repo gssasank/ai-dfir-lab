@@ -216,5 +216,134 @@ class FirstInteractiveStartTests(_RealClaudeSetup):
         self.assertTrue(data["projects"][str(self.case)]["hasTrustDialogAccepted"])
 
 
+@unittest.skipUnless(CLAUDE, "Claude Code is not installed (set DFIR_LAB_E2E_CLAUDE to a claude binary)")
+class SubscriptionRouteRealClaudeTests(_RealClaudeSetup):
+    """The subscription route with the real Claude Code and NO account: up to
+    the point where a person would sign in. Nothing here signs in; the
+    temporary CLAUDE_CONFIG_DIR holds no credential."""
+
+    THEME_SCREEN = FirstInteractiveStartTests.THEME_SCREEN
+    TRUST_SCREEN = FirstInteractiveStartTests.TRUST_SCREEN
+    _read = FirstInteractiveStartTests._read
+
+    def setUp(self):
+        super().setUp()
+        from dfir_lab import route
+        route.save("subscription")
+        self.assertFalse((self.claude_dir / ".credentials.json").exists())
+
+    def _pty(self, argv, env, cwd):
+        import fcntl
+        import pty
+        import struct
+        import subprocess
+        import termios
+        env = dict(env)
+        env.update(TERM="xterm-256color", COLUMNS="120", LINES="40")
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+        proc = subprocess.Popen(argv, cwd=str(cwd), env=env, stdin=slave, stdout=slave,
+                                stderr=slave, start_new_session=True)
+        os.close(slave)
+        return proc, master
+
+    def _stop(self, proc, master):
+        import signal
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.wait(timeout=30)
+        os.close(master)
+
+    def test_signin_check_and_check_10_say_not_signed_in(self):
+        cfg = Config()
+        mock_lines = len(self.mock_log.read_text().splitlines()) if self.mock_log.exists() else 0
+        ctx = check.run_checks(cfg, [4])
+        r = ctx.results[4]
+        self.assertEqual(r.status, "FAIL", r.result)
+        self.assertIn("not signed in with your Claude subscription", r.result)
+        settings = json.loads((self.claude_dir / "settings.json").read_text())
+        self.assertNotIn("apiKeyHelper", settings)
+        self.assertNotIn("ANTHROPIC_BASE_URL", settings["env"])
+        # Check 10 on its own: real Claude Code answers "Not logged in".
+        ctx = check.run_checks(cfg, [10])
+        r = ctx.results[10]
+        self.assertEqual(r.status, "FAIL", r.result)
+        self.assertIn("not signed in with your Claude subscription", r.result)
+        # The gateway mock was never asked anything on this route.
+        self.assertEqual(self.mock_log.read_text().splitlines()[mock_lines:], [])
+
+    def test_interactive_claude_has_no_first_run_screens(self):
+        from dfir_lab import use
+        from dfir_lab.claude_env import process_env
+        cfg = Config()
+        # Protocol SIFT's settings carry defaultMode "acceptEdits". Seen with 2.1.322:
+        # without the seeded nudge flag, the first prompt is "Make auto mode your
+        # default permission mode?" (Yes preselected) and Enter rewrites it to "auto".
+        self.claude_dir.mkdir(exist_ok=True)
+        (self.claude_dir / "settings.json").write_text(json.dumps(
+            {"permissions": {"defaultMode": "acceptEdits", "allow": ["Bash(*)"]}}))
+        use.switch(cfg, "subscription")
+        gconf = json.loads((self.claude_dir / ".claude.json").read_text())
+        self.assertTrue(gconf["hasCompletedOnboarding"])
+        self.assertTrue(gconf["hasSeenAutoDefaultNudge"])
+        nudge = ("Make auto mode your default", "Auto mode is now Claude Code's default")
+        proc, master = self._pty([CLAUDE], process_env(cfg), self.case)
+        try:
+            screen = _strip_ansi(self._read(master, None, 40, quiet=4))
+            for marker in self.THEME_SCREEN + self.TRUST_SCREEN + nudge:
+                self.assertNotIn(marker, screen, screen[-3000:])
+            self.assertIn("Claude Code", screen)
+            self.assertIn("Sonnet", screen)
+            os.write(master, b"hello\r")
+            after = _strip_ansi(self._read(master, lambda d: b"/login" in d, 30))
+            self.assertIn("Not logged in", after, after[-2000:])
+            for marker in self.THEME_SCREEN + self.TRUST_SCREEN + nudge:
+                self.assertNotIn(marker, after)
+        finally:
+            self._stop(proc, master)
+        settings = json.loads((self.claude_dir / "settings.json").read_text())
+        self.assertEqual(settings["permissions"]["defaultMode"], "acceptEdits")
+
+    def test_start_reaches_claude_codes_own_sign_in(self):
+        """`dfir-lab start` on the subscription route, not signed in: it offers
+        the sign-in, runs `claude auth login`, and Claude Code hands the
+        sign-in page to Chromium (a stub that records the link)."""
+        bindir = self.tmp / "bin"
+        bindir.mkdir()
+        calls = self.tmp / "chromium-calls.log"
+        (bindir / "chromium").write_text('#!/bin/sh\necho "$*" >> %s\n' % calls)
+        os.chmod(bindir / "chromium", 0o755)
+        env = dict(os.environ)
+        env.update(self.env())
+        env.update(DISPLAY=":0", PATH="%s:%s" % (bindir, os.environ.get("PATH", "")))
+        proc, master = self._pty([sys.executable, str(helpers.BIN / "dfir-lab"), "start"],
+                                 env, self.tmp)
+        try:
+            first = _strip_ansi(self._read(master, lambda d: b"[Y/n]" in d, 60))
+            self.assertIn("not signed in with your Claude subscription yet", first)
+            self.assertNotIn("gateway", first.lower())
+            os.write(master, b"y\r")
+            out = _strip_ansi(self._read(master, lambda d: b"Paste code here" in d, 60))
+            self.assertIn("Chromium opens a Claude sign-in page", out)
+            self.assertIn("Opening browser to sign in", out)
+            self.assertIn("If the browser didn't open, visit: https://claude.com/cai/oauth/"
+                          "authorize", out)
+            for marker in self.THEME_SCREEN + self.TRUST_SCREEN:
+                self.assertNotIn(marker, first + out)
+            # Claude Code starts the browser alongside printing the link; give it a moment.
+            import time
+            for _ in range(50):
+                if calls.exists():
+                    break
+                time.sleep(0.2)
+        finally:
+            self._stop(proc, master)
+        self.assertIn("https://claude.com/cai/oauth/authorize", calls.read_text())
+        self.assertIn("redirect_uri=http%3A%2F%2Flocalhost", calls.read_text())
+        self.assertFalse((self.claude_dir / ".credentials.json").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

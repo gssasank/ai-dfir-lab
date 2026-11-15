@@ -32,15 +32,15 @@ class BuildTests(unittest.TestCase):
                          "efe06d12388dbc000fa4ae306746ddaca3893a6cdbd55311b52f5833e717acd9")
         self.assertEqual(rel["IMAGE_ZIP_SIZE"], "4836649413")
         self.assertEqual(rel["IMAGE_MOUNT_POINT"], "/mnt/dc01")
-        self.assertEqual((rel["REPO_OWNER"], rel["VERSION"]), ("gssasank", "1.0.0"))
+        self.assertEqual((rel["REPO_OWNER"], rel["VERSION"]), ("gssasank", "1.1.0"))
 
     def test_kit_comes_from_the_same_release_as_the_script(self):
         rel = build.read_release(build.HERE / "release.conf")
         self.assertEqual(rel["CASE_KIT_URL"],
-                         "https://raw.githubusercontent.com/gssasank/ai-dfir-lab/v1.0.0/"
+                         "https://raw.githubusercontent.com/gssasank/ai-dfir-lab/v1.1.0/"
                          "kit/szechuan-kit-0.1.0.zip")
         self.assertTrue(build.student_command(rel, "0" * 64).startswith(
-            "curl -fsSLO https://raw.githubusercontent.com/gssasank/ai-dfir-lab/v1.0.0/"))
+            "curl -fsSLO https://raw.githubusercontent.com/gssasank/ai-dfir-lab/v1.1.0/"))
         self.assertTrue((helpers.REPO / rel["CASE_KIT_REPO_PATH"]).is_file()
                         or not (helpers.REPO / ".git").exists())
         rel2, out, _, _ = build.build(self.tmp)
@@ -94,7 +94,7 @@ class BuildTests(unittest.TestCase):
         digest = (helpers.REPO / "dist" / "bootstrap.sh.sha256").read_text().split()[0]
         self.assertIn(build.student_command(rel, digest),
                       (helpers.REPO / "README.md").read_text())
-        self.assertIn("/v1.0.0/dist/bootstrap.sh", build.student_command(rel, digest))
+        self.assertIn("/v1.1.0/dist/bootstrap.sh", build.student_command(rel, digest))
 
 
 if __name__ == "__main__":

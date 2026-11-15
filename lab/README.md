@@ -29,9 +29,52 @@ banner.
 
 The guard hook and the `permissions.deny` rules are a deterrent against the
 obvious, accidental read of the key by Claude Code (for example
-`cat ~/.config/dfir-lab/duke-api-key`). They are not a security boundary:
-Claude Code runs as the same user who owns the key, and an indirect shell
-command can still read it.
+`cat ~/.config/dfir-lab/duke-api-key`), and of a Claude subscription sign-in
+(`~/.claude/.credentials.json`, `claude setup-token`, or the sign-in's token
+values). They are not a security boundary: Claude Code runs as the same user
+who owns both files, and an indirect shell command can still read them.
+
+## Two routes: the Duke key (default) or the student's own Claude subscription
+
+`dfir-lab use duke | subscription | --status` (and the desktop shortcut "Use my
+Claude subscription") chooses how Claude Code reaches a model. The choice is
+stored in `~/dfir-lab/route.json` (no file means the Duke route), survives
+reboots and re-running the setup script, and is read by `start`, `check`,
+`report-problem` and `dfir-lab-configure-claude`.
+
+- **duke** (default): everything below, unchanged.
+- **subscription**: Claude Code signed in with the student's Claude Pro, Max
+  or higher plan. The settings merge removes the gateway lock (no
+  `apiKeyHelper`, no `ANTHROPIC_BASE_URL`, no gateway model variables, no
+  `CLAUDE_CODE_EFFORT_LEVEL`, no `IS_DEMO`, and no `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN` or `CLAUDE_CODE_USE_*` entries at all) and sets
+  `ANTHROPIC_MODEL` to `[subscription] model` (`sonnet`, the current Sonnet,
+  at Claude Code's default effort; the student may use `/model`). The deny
+  rules, the guard hook, the tool restrictions and Protocol SIFT's entries
+  stay. Claude Code's first-run screens are skipped with
+  `hasCompletedOnboarding` in `~/.claude.json` instead of `IS_DEMO` (which
+  hides the account); `start` re-seeds it, because `/logout` resets it.
+  `[claude] extra_env` (gateway tuning) is not applied on this route.
+
+Switching writes the settings file in one atomic write and then the route
+file; if the route file cannot be written, the previous route's settings are
+put back. Either way the file holds one whole route, never half of each.
+Nothing is deleted: the stored key and the sign-in stay (sign out with
+`claude auth logout`). `dfir-lab use subscription` then runs Claude Code's own
+`claude auth login --claudeai` in the terminal (with `BROWSER` set to the VM's
+Chromium when a desktop is present) and confirms the result with
+`claude auth status --json`. The toolkit never opens the sign-in file except
+to mask its token values in output (`redact.py`); anything shaped like
+`sk-ant-...` is masked too.
+
+The readiness check keeps its eleven numbers on both routes. On the
+subscription route: 4 is "Sign-in" (`claude auth status`: signed in with a
+subscription, not expired), 5 connects to `[subscription] hosts`
+(api.anthropic.com, platform.claude.com, claude.ai) directly, 6-9 are `NA`
+(not applicable; they talk to the gateway with the key), and 10 is the same
+real Claude Code task. READY means every applicable check passed; the
+readiness code is `DFIR-<version>-RS-...` (or `NS`), with the route in its
+hash. Duke-route codes are unchanged.
 
 ## What `start` sets up for Claude Code
 
@@ -108,7 +151,12 @@ Code (`test_e2e_claude.py`) are skipped unless `claude` is on `PATH` or
 `CLAUDE_CONFIG_DIR` directories and talk only to a mock on 127.0.0.1. One of
 them runs `dfir-lab start` in a pseudo-terminal with a fresh configuration
 and checks that Claude Code reaches its prompt without the theme or
-folder-trust screens.
+folder-trust screens. Three more cover the subscription route with no
+account (nothing signs in): check 4 and check 10 report "not signed in",
+interactive Claude Code shows no first-run screen and answers "Not logged
+in", and `dfir-lab start` reaches Claude Code's own sign-in step and hands the
+sign-in page to a stand-in Chromium. `test_subscription.py` covers the rest of
+the route with the fake Claude Code from `helpers.py`.
 
 ## Start the mock gateway
 
@@ -171,6 +219,7 @@ D checkpoint 1 203.0.113.77 ; D hint 2 ; D progress
 D replay demo
 D report-problem
 D start                                              # starts Claude Code in $W/case
+D use --status ; D use subscription ; D use duke     # switch the route (sign-in needs a terminal)
 ```
 
 ## Install into a VM
@@ -183,8 +232,9 @@ sudo sh lab/install.sh --user sansforensics --conf /path/to/lab.conf
 sudo sh lab/install.sh --user sansforensics --uninstall [--purge]
 ```
 
-It installs the commands, four desktop shortcuts (set up the key, start, check,
-offline replay), and the Claude Code settings.
+It installs the commands, five desktop shortcuts (set up the key, start, check,
+offline replay, use my Claude subscription), and the Claude Code settings for the
+student's route (the Duke route unless `~/dfir-lab/route.json` says otherwise).
 
 `--root DIR` stages everything under `DIR` (used by the tests).
 

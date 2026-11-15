@@ -11,6 +11,7 @@ GLOBAL_FLAGS = ("--debug", "--no-gui", "--pause")
 
 COMMANDS = [
     ("setup-key", "store and test your personal Duke AI key"),
+    ("use", "choose the AI access: your Duke key (default) or your own Claude subscription"),
     ("start", "start Claude Code in the case folder (mounts the disk image first)"),
     ("mount", "mount the case's disk image read-only (--status: show whether it is)"),
     ("unmount", "unmount the case's disk image"),
@@ -56,6 +57,17 @@ def build_parser():
     s.add_argument("--clear", action="store_true", help="delete the stored key")
     s.add_argument("--status", action="store_true",
                    help="say whether a key is stored (shows only its length and last 4 characters)")
+
+    s = sub.add_parser("use", parents=[common], help=helps["use"],
+                       description="Choose how Claude Code reaches the AI model. 'duke' (the "
+                                   "default) uses your Duke AI Gateway key. 'subscription' "
+                                   "uses your own Claude subscription (Pro, Max or higher): "
+                                   "no Duke key and no VPN, and it signs you in. Neither "
+                                   "choice deletes the key or the sign-in. To sign out of "
+                                   "your Claude account: claude auth logout")
+    s.add_argument("route", nargs="?", choices=["duke", "subscription"],
+                   help="duke or subscription")
+    s.add_argument("--status", action="store_true", help="show which one is in use")
 
     s = sub.add_parser("start", parents=[common], help=helps["start"],
                        description="Check the key and gateway, then start Claude Code in the case "
@@ -144,6 +156,9 @@ def dispatch(args, passthrough, parser, sub):
     if cmd == "setup-key":
         from . import setup_key
         return setup_key.run(cfg, from_stdin=args.from_stdin)
+    if cmd == "use":
+        from . import use
+        return use.run(cfg, args.route, status=args.status)
     if cmd == "start":
         from . import start
         extra = list(passthrough)

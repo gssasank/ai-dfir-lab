@@ -36,7 +36,7 @@ LOG_DIR="$STATE_DIR/logs"
 CLAUDE_BIN="$HOME/.local/bin/claude"
 PSIFT_MARKER="$HOME/.claude/.protocol-sift-install"
 TOOLKIT_STAMP="/usr/local/lib/dfir-lab/.setup-stamp"
-SHORTCUTS="dfir-lab-setup-key dfir-lab-start dfir-lab-check dfir-lab-replay"
+SHORTCUTS="dfir-lab-setup-key dfir-lab-start dfir-lab-check dfir-lab-replay dfir-lab-use-subscription"
 STUDENT_DIRS="analysis reports exports .claude"
 BROWSER_DESKTOP="chromium_chromium.desktop"
 BASHRC_BEGIN="# >>> dfir-lab setup (CYBERSEC 510) >>>"
@@ -60,6 +60,7 @@ TOOLKIT_OK=0
 CASE_OK=0
 IMAGE_OK=0
 CLAUDE_FOUND=""
+SETUP_ROUTE="duke"
 INCOMPLETE=()
 WARNINGS=()
 NOTES=()
@@ -1273,6 +1274,8 @@ finish_checks() {
         return
     fi
     local id status result todo name
+    # The AI access the student chose (dfir-lab use); "duke" unless they switched.
+    SETUP_ROUTE=$(printf '%s' "$json" | jq -r '.route // "duke"')
     for id in 1 2 3 4 5; do
         status=$(printf '%s' "$json" | jq -r ".results[] | select(.id == $id) | .status")
         result=$(printf '%s' "$json" | jq -r ".results[] | select(.id == $id) | .result")
@@ -1285,15 +1288,20 @@ finish_checks() {
             out "      waiting: $name (needs the case files and the disk image)"
             continue
         fi
-        case "$id:$status" in
-            [123]:PASS) out "      passed: $name: $result" ;;
-            [123]:WARN) out "      warning: $name: $result"; WARNINGS+=("$name: $result") ;;
-            [123]:SKIP) out "      skipped: $name: $result" ;;
-            [123]:*) incomplete "readiness check '$name' failed: $result" "${todo:-Tell the TA and send the log.}" ;;
-            4:PASS) out "      passed: Duke AI key: stored" ;;
-            4:*) out "      not yet: no Duke AI key is stored (that is your next step)" ;;
-            5:PASS) out "      passed: Duke AI gateway: reachable" ;;
-            5:*) out "      not now: the Duke AI gateway cannot be reached from this VM"
+        case "$SETUP_ROUTE:$id:$status" in
+            *:[123]:PASS) out "      passed: $name: $result" ;;
+            *:[123]:WARN) out "      warning: $name: $result"; WARNINGS+=("$name: $result") ;;
+            *:[123]:SKIP) out "      skipped: $name: $result" ;;
+            *:[123]:*) incomplete "readiness check '$name' failed: $result" "${todo:-Tell the TA and send the log.}" ;;
+            subscription:4:PASS) out "      passed: Claude subscription: Claude Code is ${result%%;*}" ;;
+            subscription:4:*) out "      not yet: Claude Code is not signed in with your Claude subscription (run: dfir-lab use subscription)" ;;
+            subscription:5:PASS) out "      passed: Anthropic's service: reachable (no VPN needed)" ;;
+            subscription:5:*) out "      not now: Anthropic's service cannot be reached from this VM"
+                 NOTES+=("Anthropic's service was not reachable during setup. Check that the VM has internet access; \"Check my setup\" tests it.") ;;
+            *:4:PASS) out "      passed: Duke AI key: stored" ;;
+            *:4:*) out "      not yet: no Duke AI key is stored (that is your next step)" ;;
+            *:5:PASS) out "      passed: Duke AI gateway: reachable" ;;
+            *:5:*) out "      not now: the Duke AI gateway cannot be reached from this VM"
                  NOTES+=("The Duke AI gateway was not reachable during setup. Before the lab, connect your computer to the Duke VPN (or the Duke network); \"Check my setup\" tests it.") ;;
         esac
     done
@@ -1355,8 +1363,14 @@ summary() {
     if [ ${#INCOMPLETE[@]} -eq 0 ]; then
         out ""
         out " Next steps:"
-        out "   1. Double-click \"Set up Duke AI access\" on the desktop and paste your Duke AI key."
-        out "   2. Double-click \"Check my setup\"."
+        if [ "$SETUP_ROUTE" = subscription ]; then
+            out "   1. The lab uses your own Claude subscription (to use a Duke key instead: dfir-lab use duke)."
+            out "   2. Double-click \"Check my setup\"."
+        else
+            out "   1. Double-click \"Set up Duke AI access\" on the desktop and paste your Duke AI key."
+            out "   2. Double-click \"Check my setup\"."
+            out " Optional: if you already pay for Claude (Pro or Max), you can use it instead of a Duke key; see the README."
+        fi
     fi
     out "$line"
     log "finished: changed=$CHANGED incomplete=${#INCOMPLETE[@]} warnings=${#WARNINGS[@]} seconds=$SECONDS"

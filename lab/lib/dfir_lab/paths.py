@@ -8,6 +8,7 @@ DEFAULT_CONF = "/etc/dfir-lab/lab.conf"
 KEY_FILE_NAME = "duke-api-key"
 HELPER_NAME = "key-helper"
 GUARD_NAME = "pretool-guard"
+CREDENTIALS_NAME = ".credentials.json"
 
 
 def home():
@@ -38,6 +39,12 @@ def progress_file():
     return state_dir() / "progress.json"
 
 
+def route_file():
+    """Which way the student connects Claude Code (Duke key or their own Claude
+    subscription). Kept in the student's own lab state, not in lab.conf."""
+    return state_dir() / "route.json"
+
+
 def toolkit_log():
     return logs_dir() / "dfir-lab.log"
 
@@ -57,6 +64,14 @@ def claude_config_dir():
 
 def claude_settings_file():
     return claude_config_dir() / "settings.json"
+
+
+def claude_credentials_file():
+    """Where Claude Code keeps a subscription sign-in on Linux:
+    ~/.claude/.credentials.json (mode 0600), or the same name under
+    $CLAUDE_CONFIG_DIR when that is set (code.claude.com/docs/en/authentication,
+    read 2026-11-14)."""
+    return claude_config_dir() / CREDENTIALS_NAME
 
 
 def claude_global_config():

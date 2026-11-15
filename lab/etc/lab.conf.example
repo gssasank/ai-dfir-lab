@@ -42,6 +42,16 @@ effort =
 ;   API_TIMEOUT_MS=600000
 extra_env =
 
+[subscription]
+; Optional route: Claude Code signed in with the student's own Claude
+; subscription (Pro, Max or higher) instead of the gateway. Students choose it
+; with `dfir-lab use subscription` (stored in ~/dfir-lab/route.json) and go back
+; with `dfir-lab use duke`. The [gateway] and [claude] effort/extra_env values
+; are not used on that route.
+model = sonnet                       ; Claude Code model alias or ID (sonnet = current Sonnet)
+hosts = https://api.anthropic.com https://platform.claude.com https://claude.ai
+                                     ; hosts readiness check 5 connects to on that route
+
 [case]
 id =                                 ; REQUIRED. Short case identifier, used in file names
 title =                              ; human-readable case name (default: id)

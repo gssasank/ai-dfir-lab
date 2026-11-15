@@ -15,7 +15,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import casekit, configure_claude, disk, fsutil, keystore, paths, readiness, ui
+from . import (casekit, configure_claude, disk, fsutil, keystore, paths, readiness,
+               route as route_mod, subscription, ui)
 from .claude_env import find_claude, process_env, require_min_version
 from .errors import ConfigError, LabError, UsageError
 from .gateway import (Gateway, KeyLimits, classify, model_ids, probe_network, similar_models,
@@ -24,6 +25,9 @@ from .messages import CANNOT_REACH, outcome_fields, render
 from .redact import redact
 
 PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
+# "Not applicable": a check the student's route does not use (the gateway
+# checks 6-9 on the subscription route). Not a failure.
+NA = readiness.NA
 CLOCK_WARN_S = 300
 TOOL_TIMEOUT_S = 20
 BUFFER_GAP_S = 0.05
@@ -48,8 +52,10 @@ class Result:
 
 
 class Ctx:
-    def __init__(self, cfg):
+    def __init__(self, cfg, route=None):
         self.cfg = cfg
+        self.route = route_mod.resolve(route)
+        self.auth = None
         self._key = None
         self._gw = None
         self.net = None
@@ -265,7 +271,7 @@ def check_tools(ctx):
 # 3. Case files
 # --------------------------------------------------------------------------
 
-_RANK = {PASS: 0, SKIP: 0, WARN: 1, FAIL: 2}
+_RANK = {PASS: 0, SKIP: 0, NA: 0, WARN: 1, FAIL: 2}
 
 
 def check_case(ctx):
@@ -406,6 +412,71 @@ def check_network(ctx):
     tls = (", TLS %s OK" % net.tls_version) if net.scheme == "https" else ", plain HTTP (no TLS)"
     return Result(5, "Network", PASS, "%s resolves to %s, connected in %.0f ms%s" % (
         net.host, net.address, net.connect_ms, tls), "", data)
+
+
+# --------------------------------------------------------------------------
+# 4-5 on the subscription route: signed in, Anthropic reachable
+# --------------------------------------------------------------------------
+
+def check_signin(ctx):
+    """Check 4 (subscription route): Claude Code is signed in with a Claude
+    subscription. Asks Claude Code itself (`claude auth status --json`); the
+    sign-in file is never opened."""
+    cfg, name = ctx.cfg, "Sign-in"
+    try:
+        exe = find_claude(cfg)
+    except ConfigError as exc:
+        return Result(4, name, FAIL, exc.what, exc.todo)
+    try:
+        configure_claude.ensure(cfg, quiet=True, route=ctx.route)
+    except LabError as exc:
+        return Result(4, name, FAIL, exc.what, exc.todo)
+    st = subscription.auth_status(cfg, exe)
+    ctx.auth = st
+    data = {"method": st.method, "plan": st.plan, "expires": st.expires}
+    if not st.ok:
+        return Result(4, name, FAIL, "Could not ask Claude Code whether it is signed in: %s."
+                      % st.detail, "Run the check again. If it fails again, run dfir-lab "
+                      "report-problem and send the file to the TA.", data)
+    if st.expired:
+        what, todo = render("sub_login_expired", cfg,
+                            detail="the sign-in ended on %s" % st.expires)
+        return Result(4, name, FAIL, what, todo, data)
+    if not st.signed_in:
+        kind = "sub_wrong_login" if st.logged_in else "sub_not_signed_in"
+        what, todo = render(kind, cfg, detail=subscription.describe(st))
+        return Result(4, name, FAIL, what, todo, data)
+    text = "%s; Claude Code will use %s" % (subscription.describe(st),
+                                             subscription.model_text(cfg))
+    if st.ends_soon:
+        return Result(4, name, WARN, text + "; the sign-in ends within a day (%s)" % st.expires,
+                      "Sign in again before the lab: dfir-lab use subscription", data)
+    return Result(4, name, PASS, text, "", data)
+
+
+def check_anthropic(ctx):
+    """Check 5 (subscription route): Anthropic's service, reached directly from
+    the VM (no VPN): the API, the sign-in token service and the sign-in pages."""
+    cfg = ctx.cfg
+    timeout = cfg.connect_timeout
+    parts, data = [], {"hosts": []}
+    for url in cfg.subscription_hosts:
+        net = probe_network(url, timeout)
+        data["hosts"].append({"host": net.host, "kind": net.kind, "address": net.address,
+                              "connect_ms": round(net.connect_ms, 1)})
+        if not net.ok:
+            what, todo = render("sub_no_network", cfg, **subscription.net_fields(net))
+            return Result(5, "Network", FAIL, what, todo, data)
+        parts.append("%s (%.0f ms, TLS %s)" % (net.host, net.connect_ms, net.tls_version or "?"))
+    return Result(5, "Network", PASS, "Anthropic's service reachable directly, no VPN needed: "
+                  + ", ".join(parts), "", data)
+
+
+def not_applicable(cid, name):
+    def fn(ctx):
+        return Result(cid, name, NA, "not applicable on the subscription route (it does not "
+                      "use the Duke gateway)")
+    return fn
 
 
 # --------------------------------------------------------------------------
@@ -642,7 +713,7 @@ def check_claude(ctx):
         return Result(10, name, FAIL, exc.what, exc.todo)
     # The course settings must be in place, or Claude Code is not run (spec 6.4).
     try:
-        configure_claude.ensure(cfg, quiet=True)
+        configure_claude.ensure(cfg, quiet=True, route=ctx.route)
     except LabError as exc:
         return Result(10, name, FAIL, exc.what + " Claude Code was not run, because it would "
                       "run without the course settings.", exc.todo)
@@ -666,7 +737,7 @@ def check_claude(ctx):
                "--allowedTools", READINESS_ALLOWED_TOOL, "--no-session-persistence"]
         ui.debug("running Claude Code: %s" % " ".join(shlex.quote(c) for c in cmd))
         start = time.monotonic()
-        proc = subprocess.Popen(cmd, cwd=str(tmp), env=process_env(cfg),
+        proc = subprocess.Popen(cmd, cwd=str(tmp), env=process_env(cfg, route=ctx.route),
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, start_new_session=True)
         try:
@@ -676,8 +747,11 @@ def check_claude(ctx):
             proc.communicate()
             return Result(10, name, FAIL,
                           "Claude Code did not finish the test task within %g seconds." % limit_s,
-                          "The gateway may be slow or a reply stalled. Try again; if it fails "
-                          "twice, run dfir-lab report-problem and send the file to the TA.")
+                          "%s Try again; if it fails twice, run dfir-lab report-problem and "
+                          "send the file to the TA." % (
+                              "Anthropic's service may be slow or a reply stalled."
+                              if ctx.route == route_mod.SUBSCRIPTION else
+                              "The gateway may be slow or a reply stalled."))
         elapsed = time.monotonic() - start
         # Redact whole outputs before picking lines out of them.
         out_text = redact(stdout.decode("utf-8", errors="replace"))
@@ -705,6 +779,13 @@ def check_claude(ctx):
             lines = [l for l in (err_text or out_text).splitlines() if l.strip()]
             detail = lines[-1] if lines else "no output"
         detail = redact(detail.strip())[:300]
+        if ctx.route == route_mod.SUBSCRIPTION:
+            kind = subscription.classify_text("%s\n%s" % (detail, err_text[-2000:]))
+            if kind:
+                data["outcome"] = kind
+                what, todo = render(kind, cfg, detail=detail, host="api.anthropic.com",
+                                    reason="could not be reached")
+                return Result(10, name, FAIL, what, todo, data)
         if isinstance(info, dict) and "max_turns" in str(info.get("subtype", "")):
             what = "Claude Code used up its %d-turn limit without finishing the test task." % max_turns
         elif result_file.is_file():
@@ -779,6 +860,32 @@ CHECKS = [
 ]
 NAMES = {cid: name for cid, name, _, _ in CHECKS}
 
+# The optional subscription route: same numbers, so the readiness code, the
+# setup script and the documents line up. 4 and 5 become the sign-in and
+# Anthropic's service; 6-9 talk to the Duke gateway with the key and are not
+# applicable; 10 is the same real Claude Code task.
+SUBSCRIPTION_CHECKS = [
+    (1, "System", check_system, ()),
+    (2, "Tools", check_tools, ()),
+    (3, "Case files", check_case, ()),
+    (4, "Sign-in", check_signin, ()),
+    (5, "Network", check_anthropic, ()),
+    (6, "Gateway login", not_applicable(6, "Gateway login"), ()),
+    (7, "Model answers", not_applicable(7, "Model answers"), ()),
+    (8, "Streaming", not_applicable(8, "Streaming"), ()),
+    (9, "Tool use", not_applicable(9, "Tool use"), ()),
+    (10, "Claude Code task", check_claude, (4, 5)),
+    (11, "Results", check_results, ()),
+]
+
+
+def checks_for(route):
+    return SUBSCRIPTION_CHECKS if route == route_mod.SUBSCRIPTION else CHECKS
+
+
+def names_for(route):
+    return {cid: name for cid, name, _, _ in checks_for(route)}
+
 
 def parse_only(text):
     try:
@@ -793,16 +900,18 @@ def parse_only(text):
     return ids
 
 
-def run_checks(cfg, selected, on_result=None):
-    ctx = Ctx(cfg)
-    for cid, name, fn, deps in CHECKS:
+def run_checks(cfg, selected, on_result=None, route=None):
+    """Run the selected checks for a route (default: the stored route)."""
+    ctx = Ctx(cfg, route)
+    names = names_for(ctx.route)
+    for cid, name, fn, deps in checks_for(ctx.route):
         if cid not in selected:
             continue
         blocker = next((d for d in deps if d in ctx.results and ctx.results[d].status in
                         (FAIL, SKIP)), None)
         if blocker is not None:
             r = Result(cid, name, SKIP, "skipped because check %d (%s) did not pass"
-                       % (blocker, NAMES[blocker]))
+                       % (blocker, names[blocker]))
         else:
             try:
                 r = fn(ctx)
@@ -823,18 +932,31 @@ def run_checks(cfg, selected, on_result=None):
     return ctx
 
 
+def _shown_status(status):
+    return "N/A" if status == NA else status
+
+
 def _line(r):
-    return "%2d  %-17s %-4s  %s" % (r.id, r.name, r.status, r.result)
+    return "%2d  %-17s %-4s  %s" % (r.id, r.name, _shown_status(r.status), r.result)
+
+
+def _route_line(route):
+    if route == route_mod.SUBSCRIPTION:
+        return "AI access   : your own Claude subscription (checks 6-9 do not apply)"
+    return "AI access   : your Duke AI Gateway key"
 
 
 def build_report(cfg, ctx, code, ready, partial, when):
+    sub = ctx.route == route_mod.SUBSCRIPTION
     lines = [
         "DFIR Lab readiness report",
+        "This report does not contain your Claude sign-in or any key." if sub else
         "This report does not contain your Duke AI key.",
         "",
         "Lab version : %s" % cfg.lab_version,
         "Course      : %s" % cfg.course,
         "Case        : %s" % cfg.get("case", "id"),
+        _route_line(ctx.route),
         "Time (UTC)  : %s" % fsutil.utc_iso(when),
         "Host        : %s" % socket.gethostname(),
         "",
@@ -848,24 +970,31 @@ def build_report(cfg, ctx, code, ready, partial, when):
         "Result      : %s%s" % ("READY" if ready else "NOT READY",
                                 " (partial check)" if partial else ""),
         "Readiness code: %s" % code,
-        "Tokens used : %d input + %d output = %d (checks 7-10)" % (
-            ctx.tokens_in, ctx.tokens_out, ctx.tokens_in + ctx.tokens_out),
+        "Tokens used : %d input + %d output = %d (%s)" % (
+            ctx.tokens_in, ctx.tokens_out, ctx.tokens_in + ctx.tokens_out,
+            "check 10" if sub else "checks 7-10"),
     ]
     return "\n".join(lines) + "\n"
 
 
-def run(cfg, quick=False, as_json=False, only=None):
+def run(cfg, quick=False, as_json=False, only=None, route=None):
     cfg.require_all()
+    route = route_mod.resolve(route)
+    all_ids = list(names_for(route))
     if only:
         selected = parse_only(only)
     elif quick:
         selected = [1, 2, 3, 4, 5]
     else:
-        selected = list(NAMES)
-    partial = selected != list(NAMES)
+        selected = all_ids
+    partial = selected != all_ids
+    sub = route == route_mod.SUBSCRIPTION
     if not as_json:
         ui.out("DFIR Lab readiness check (lab version %s)%s" % (
             cfg.lab_version, " - quick" if quick else ""))
+        if sub:
+            ui.out("AI access: your own Claude subscription. Checks 6-9 test the Duke gateway "
+                   "and do not apply (N/A).")
         ui.out("")
 
     def show(r):
@@ -875,7 +1004,7 @@ def run(cfg, quick=False, as_json=False, only=None):
         if r.todo and r.status in (FAIL, WARN):
             ui.out("    What to do: %s" % r.todo)
 
-    ctx = run_checks(cfg, selected, on_result=show)
+    ctx = run_checks(cfg, selected, on_result=show, route=route)
     r1 = ctx.results.get(1)
     if r1 is not None and r1.data.get("clock_amended") and not as_json:
         ui.out("Update to check 1 after talking to the gateway:")
@@ -883,14 +1012,15 @@ def run(cfg, quick=False, as_json=False, only=None):
     when = fsutil.utc_now()
     date = when.strftime("%Y-%m-%d")
     pairs = [(r.id, r.status) for r in ctx.results.values()]
-    code = readiness.compute(cfg.lab_version, pairs, date)
-    ready = readiness.is_ready(pairs)
+    code = readiness.compute(cfg.lab_version, pairs, date, route)
+    ready = readiness.is_ready(pairs, route)
     any_fail = any(s == FAIL for _, s in pairs)
     doc = {
         "version": cfg.lab_version,
         "date": date,
         "time": fsutil.utc_iso(when),
         "case": cfg.get("case", "id"),
+        "route": route,
         "partial": partial,
         "results": [{"id": r.id, "name": r.name, "status": r.status, "result": r.result,
                      "todo": r.todo} for r in ctx.results.values()],
@@ -911,14 +1041,15 @@ def run(cfg, quick=False, as_json=False, only=None):
         txt = None
         ui.problem("Could not save the readiness report (%s)." % (exc.strerror or exc),
                    "Check that your home folder is not full.")
-    fsutil.log("check", code=code, ready=ready, partial=partial,
+    fsutil.log("check", code=code, ready=ready, partial=partial, route=route,
                results=",".join("%d=%s" % p for p in pairs))
     if as_json:
         ui.out(json.dumps(doc, indent=2))
     else:
         ui.out("")
         if ready:
-            ui.out("READY - every check passed%s." % (
+            ui.out("READY - every check %spassed%s." % (
+                "that applies to the subscription route " if sub else "",
                 " (with warnings above)" if any(s == WARN for _, s in pairs) else ""))
         elif partial:
             ui.out("NOT READY - this was a partial check (%s). Run  dfir-lab check  without "

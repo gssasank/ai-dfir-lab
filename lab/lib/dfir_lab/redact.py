@@ -1,7 +1,10 @@
 """The one redaction function.
 
 Every piece of text the toolkit writes to the screen or to a file goes
-through `redact()`, which replaces the stored key with MARK.
+through `redact()`, which replaces the stored key with MARK. The tokens of a
+Claude subscription sign-in (read from Claude Code's sign-in file) are
+handled the same way, and anything shaped like an Anthropic credential
+(sk-ant-...) becomes CREDENTIAL_MARK.
 
 Scope, stated honestly: it catches the key in the listed forms below, not
 under arbitrary transformations. Anything else (encryption, compression,
@@ -35,7 +38,15 @@ import re
 from . import paths
 
 MARK = "[REDACTED-KEY]"
+CREDENTIAL_MARK = "[REDACTED-CREDENTIAL]"
 MIN_SECRET_LEN = 4
+# Anthropic credentials recognised by their shape wherever they appear: API
+# keys (sk-ant-api03-...) and the OAuth access and refresh tokens of a Claude
+# subscription sign-in (sk-ant-oat01-..., sk-ant-ort01-...).
+TOKEN_RE = re.compile(r"sk-ant-[a-z]{2,8}[0-9]{0,3}-[A-Za-z0-9_\-]{8,}")
+# Keys in Claude Code's sign-in file whose values are secrets.
+_CREDENTIAL_FIELDS = ("accessToken", "refreshToken")
+MIN_CREDENTIAL_LEN = 16
 # Between two encoded key characters we tolerate whitespace (Unicode-aware),
 # zero-width characters, and literal \n \r \t escape sequences.
 _SEP = r"(?:[\s​‌‍⁠﻿]|\\[nrt])*"
@@ -114,16 +125,18 @@ class Redactor:
             return "", 0
         if not isinstance(text, str):
             text = str(text)
-        if not self._re:
-            return text, 0
-        return self._re.subn(MARK, text)
+        n = 0
+        if self._re:
+            text, n = self._re.subn(MARK, text)
+        text, m = TOKEN_RE.subn(CREDENTIAL_MARK, text)
+        return text, n + m
 
     def redact_bytes(self, data):
         """Bytes are decoded as UTF-8 (undecodable bytes kept as they are), so
         Unicode whitespace between key characters is recognised too."""
-        if not self._re:
+        text, n = self.redact_count(data.decode("utf-8", errors="surrogateescape"))
+        if not n:
             return data, 0
-        text, n = self._re.subn(MARK, data.decode("utf-8", errors="surrogateescape"))
         return text.encode("utf-8", errors="surrogateescape"), n
 
 
@@ -138,17 +151,46 @@ def _read_stored_key():
         return ""
 
 
+def _credential_values(obj, out):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in _CREDENTIAL_FIELDS and isinstance(v, str) and len(v) >= MIN_CREDENTIAL_LEN:
+                out.append(v)
+            else:
+                _credential_values(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _credential_values(v, out)
+    return out
+
+
+def _read_claude_credentials():
+    """The token values in Claude Code's sign-in file, so that output which
+    happens to contain them is masked like the key. The values are only held
+    in memory for matching; nothing is written."""
+    import json
+    try:
+        with open(paths.claude_credentials_file(), "r", encoding="utf-8") as fh:
+            return _credential_values(json.load(fh), [])
+    except (OSError, ValueError):
+        return []
+
+
+def _secrets():
+    return [_read_stored_key()] + _read_claude_credentials()
+
+
 def get():
     global _current
     if _current is None:
-        _current = Redactor([_read_stored_key()])
+        _current = Redactor(_secrets())
     return _current
 
 
 def reset(extra=None):
-    """Reload the stored key (call after the key changes)."""
+    """Reload the stored key and sign-in (call after either changes)."""
     global _current
-    _current = Redactor([_read_stored_key()])
+    _current = Redactor(_secrets())
     if extra:
         _current.add(extra)
     return _current
