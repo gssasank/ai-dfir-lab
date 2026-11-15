@@ -20,7 +20,8 @@ from pathlib import Path
 
 LAB = Path(__file__).resolve().parents[1]
 REPO = LAB.parent
-FIXTURE = LAB / "tests" / "fixtures" / "sample-case"
+FIXTURES = LAB / "tests" / "fixtures"
+FIXTURE = FIXTURES / "sample-case"
 MOCK_DIR = REPO / "tools" / "mock-gateway"
 BIN = LAB / "bin"
 
@@ -240,3 +241,8 @@ class LabTestCase(unittest.TestCase):
 def read_json(path):
     with open(path, encoding="utf-8") as fh:
         return json.load(fh)
+
+
+def gateway_fixture(name):
+    """A response captured from the real Duke gateway (fixtures/gateway/<name>.json)."""
+    return read_json(FIXTURES / "gateway" / (name + ".json"))

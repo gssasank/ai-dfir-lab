@@ -28,6 +28,10 @@ dashboard_url =                      ; where students copy their key; named in "
 binary = claude                      ; Claude Code program (name on PATH or absolute path)
 max_turns_readiness = 6              ; turn limit for readiness check 10
 readiness_timeout_s = 180            ; wall-clock limit for readiness check 10
+; Claude Code effort level: low, medium, high, xhigh, max or auto (empty = Claude
+; Code's own default, medium for Haiku 5.5). Set as CLAUDE_CODE_EFFORT_LEVEL, which
+; takes precedence over /effort, so every student runs at the same level.
+effort =
 ; Optional extra environment for Claude Code, one NAME=VALUE per indented line.
 ; It is written into ~/.claude/settings.json "env" and set when dfir-lab starts
 ; Claude Code. Never put the key here, and do not set ANTHROPIC_API_KEY,

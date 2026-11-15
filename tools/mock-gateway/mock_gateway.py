@@ -6,6 +6,7 @@ without access to the real gateway.
 
 Routes
   GET  /v1/models                    model list (LiteLLM/Anthropic shape)
+  GET  /key/info                     the key's own limits (LiteLLM shape)
   POST /v1/messages[?beta=true]      plain JSON or server-sent events
   POST /v1/messages/count_tokens     rough token count
   HEAD /api/hello                    connection warm-up probe
@@ -19,19 +20,28 @@ A request can also select a fault for itself with the header
 
 Faults
   none, wrong-key, forbidden-model, unknown-model-404, unknown-model-400,
-  rate-limit, server-error, slow-first-byte, buffered-stream, dropped-stream,
-  no-anthropic-route, unsupported-param, no-healthy-deployments, cooldown,
-  upstream-auth
+  rate-limit, budget, server-error, slow-first-byte, buffered-stream,
+  dropped-stream, cached-replay, no-anthropic-route, unsupported-param,
+  provider-reject, no-healthy-deployments, cooldown, upstream-auth
 
-Errors use the envelope current LiteLLM returns (BerriAI/litellm main,
-proxy/common_utils/anthropic_error_payload.py, read 2026-11-13): on
-/v1/messages, and on /v1/models when the request has an anthropic-version
-header,
-  {"type": "error", "error": {"type": "<Anthropic type>", "message": "...",
-                              "litellm_error_type": "<ProxyErrorTypes>"}}
-and the OpenAI-style {"error": {"message", "type", "param", "code"}} otherwise.
-The messages follow LiteLLM's source and error reference; the exact text of
-the unsupported-parameter and upstream-auth messages is an approximation.
+Formats copied from the real Duke gateway (LiteLLM 1.108.7, sampled
+2026-11-14; the bodies are in lab/tests/fixtures/gateway/):
+  - wrong or missing key: 401 in the OpenAI-style envelope
+    {"error": {"message", "type": "token_not_found_in_db"|"auth_error", "param", "code"}}
+    on every route, /v1/messages included;
+  - a model the key may not use, or that does not exist: 403, same envelope,
+    type "team_model_access_denied" (forbidden-model, and any unknown model);
+  - per-minute limit: 429 {"type": "error", "error": {"type": "rate_limit_error",
+    "message": "LiteLLM Rate Limit Handler ... current tpm: N, tpm limit: 40000 ..."}},
+    no retry-after header (rate-limit);
+  - a field the provider rejects: 400 Anthropic envelope wrapping the
+    provider's own error JSON (provider-reject);
+  - a repeated identical request: replayed from the response cache, a stream
+    all at once with a ping first and an x-litellm-cache-key header (cached-replay);
+  - x-litellm-key-{rpm,tpm}-limit, -max-budget and -spend headers on answers.
+Not sampled, so approximations from LiteLLM's source and docs: budget,
+unknown-model-404/-400, unsupported-param, no-healthy-deployments, cooldown,
+upstream-auth, server-error.
 
 Scenarios
   A scenario file lists the replies to return, in order, for requests that
@@ -58,9 +68,13 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 FAULTS = ("none", "wrong-key", "forbidden-model", "unknown-model-404", "unknown-model-400",
-          "rate-limit", "server-error", "slow-first-byte", "buffered-stream", "dropped-stream",
-          "no-anthropic-route", "unsupported-param", "no-healthy-deployments", "cooldown",
-          "upstream-auth")
+          "rate-limit", "budget", "server-error", "slow-first-byte", "buffered-stream",
+          "dropped-stream", "cached-replay", "no-anthropic-route", "unsupported-param",
+          "provider-reject", "no-healthy-deployments", "cooldown", "upstream-auth")
+
+# The Duke key's limits (GET /key/info, 2026-11-14).
+KEY_LIMITS = {"rpm_limit": 20, "tpm_limit": 40000, "max_budget": 1.0, "budget_duration": "24h",
+              "max_parallel_requests": 40}
 
 # HTTP status -> Anthropic error type, as in the Anthropic API.
 ANTHROPIC_TYPES = {400: "invalid_request_error", 401: "authentication_error",
@@ -225,13 +239,27 @@ class Handler(BaseHTTPRequestHandler):
         return u.path.rstrip("/") or "/"
 
     def _auth_error(self, presented):
-        tail = presented[-4:] if len(presented) >= 4 else ""
-        # LiteLLM echoes a masked key; the mock does the same so tests prove
-        # the toolkit never prints more than this.
-        return self._error(401, "Authentication Error, Invalid proxy server token passed. "
-                           "Received API Key = sk-...%s, Key Hash (Token) =%s. Unable to find "
-                           "token in cache or `LiteLLM_VerificationTokenTable`"
-                           % (tail, uuid.uuid4().hex), "token_not_found_in_db", param="key")
+        # The Duke gateway's exact bodies (2026-11-14), in the OpenAI-style
+        # envelope on every route.
+        if not presented:
+            return self._send_json(401, _err("Authentication Error, No api key passed in.",
+                                             "auth_error", 401, "None"))
+        return self._send_json(401, _err("Authentication Error, Invalid API key provided.",
+                                         "token_not_found_in_db", 401, "key"))
+
+    def _model_denied(self, model):
+        # The Duke gateway's answer for a model the key may not use and for a
+        # model name it does not know (2026-11-14).
+        return self._send_json(403, _err(
+            "The requested model '%s' is not available for this API key, or the model name "
+            "is invalid. Check the models available to you and try again." % model,
+            "team_model_access_denied", 403, "model"))
+
+    def _limit_headers(self):
+        return {"x-litellm-key-rpm-limit": str(KEY_LIMITS["rpm_limit"]),
+                "x-litellm-key-tpm-limit": str(KEY_LIMITS["tpm_limit"]),
+                "x-litellm-key-max-budget": str(KEY_LIMITS["max_budget"]),
+                "x-litellm-key-spend": "0.0123", "x-litellm-version": "1.108.7"}
 
     # -- verbs ----------------------------------------------------------
     def do_HEAD(self):
@@ -255,6 +283,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(200, {"status": "ok"})
         if route == "/v1/models":
             return self._models()
+        if route == "/key/info":
+            return self._key_info()
         self.state.log(method="GET", path=route, status=404)
         self._send_json(404, {"detail": "Not Found"})
 
@@ -293,12 +323,27 @@ class Handler(BaseHTTPRequestHandler):
         if fault == "rate-limit":
             self.state.log(method=self.command, path=route, model=model, stream=stream,
                            status=429, fault=fault)
-            # LiteLLM's per-key limiter (docs: "Rate limit exceeded for api_key: ...",
-            # type throttling_error, with retry-after).
-            self._error(429, "Rate limit exceeded for api_key: sk-...%s. Limit type: requests. "
-                        "Current limit: 100, Remaining: 0. Limit resets at: 2026-11-14 00:00:00 "
-                        "UTC" % (self.state.key[-4:] if self.state.key else ""),
-                        "throttling_error", {"retry-after": "3600"})
+            # The Duke gateway's per-key limiter, exactly (2026-11-14): Anthropic
+            # envelope on every route, no retry-after header.
+            body = {"type": "error", "error": {"type": "rate_limit_error", "message": (
+                "LiteLLM Rate Limit Handler for rate limit type = key. Crossed TPM / RPM / Max "
+                "Parallel Request Limit. current rpm: 2, rpm limit: %d, current tpm: 52397, "
+                "tpm limit: %d, current max_parallel_requests: 0, max_parallel_requests: %d"
+                % (KEY_LIMITS["rpm_limit"], KEY_LIMITS["tpm_limit"],
+                   KEY_LIMITS["max_parallel_requests"]))},
+                "request_id": str(uuid.uuid4())}
+            self._send_json(429, body, dict(self._limit_headers(), **{"x-litellm-response-cost": "0"}))
+            return True
+        if fault == "budget":
+            self.state.log(method=self.command, path=route, model=model, stream=stream,
+                           status=400, fault=fault)
+            # NOT sampled from the real gateway (it would have meant spending the
+            # key's budget). LiteLLM raises budget_exceeded from the same
+            # key-check code as the auth errors, which came back in the
+            # OpenAI-style envelope; this mirrors that.
+            self._send_json(400, _err("Budget has been exceeded! Current cost: 1.0003, Max "
+                                      "budget: 1.0", "budget_exceeded", 400, None),
+                            self._limit_headers())
             return True
         if fault == "server-error":
             self.state.log(method=self.command, path=route, model=model, stream=stream,
@@ -347,6 +392,17 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"data": data, "object": "list", "has_more": False,
                               "first_id": models[0] if models else None,
                               "last_id": models[-1] if models else None})
+
+    def _key_info(self):
+        auth, presented = self._auth()
+        if self._fault() == "wrong-key" or auth != "ok":
+            self.state.log(method="GET", path="/key/info", status=401, auth=auth)
+            return self._auth_error(presented)
+        self.state.log(method="GET", path="/key/info", status=200)
+        info = dict(KEY_LIMITS, spend=0.0123, budget_reset_at="2026-11-15T05:00:00+00:00",
+                    key_name="sk-...%s" % self.state.key[-4:], models=["all-team-models"],
+                    expires="2027-03-14T23:51:12+00:00")
+        return self._send_json(200, {"key": "hashed", "info": info})
 
     def _count_tokens(self, body):
         route = "/v1/messages/count_tokens"
@@ -398,20 +454,35 @@ class Handler(BaseHTTPRequestHandler):
         if fault == "forbidden-model":
             self.state.log(method="POST", path=route, model=model, stream=stream, status=403,
                            fault=fault)
-            # LiteLLM's current generic model-access message (model_access_denied.py).
-            return self._error(403, "The requested model '%s' is not available for this API "
-                               "key, or the model name is invalid. Check the models available "
-                               "to you and try again." % model, "key_model_access_denied")
+            return self._model_denied(model)
         if fault == "unknown-model-404":
             self.state.log(method="POST", path=route, model=model, stream=stream, status=404,
                            fault=fault)
             # The provider's not-found body, relayed by LiteLLM.
             return self._error(404, "model: %s" % model)
-        if fault == "unknown-model-400" or model not in self.state.models:
+        if fault == "unknown-model-400":
             self.state.log(method="POST", path=route, model=model, stream=stream, status=400,
                            fault=fault)
             return self._error(400, "/v1/messages: Invalid model name passed in model=%s. Call "
                                "`/v1/models` to view available models for your key." % model)
+        if model not in self.state.models:
+            self.state.log(method="POST", path=route, model=model, stream=stream, status=403,
+                           fault=fault)
+            return self._model_denied(model)
+        if fault == "provider-reject":
+            self.state.log(method="POST", path=route, model=model, stream=stream, status=400,
+                           fault=fault)
+            # The Duke gateway relaying the provider's own validation error (2026-11-14).
+            inner = json.dumps({"type": "error", "error": {
+                "type": "invalid_request_error",
+                "message": "output_config.effort: Input should be 'low', 'medium', 'high', "
+                           "'xhigh' or 'max'"}, "request_id": "req_mock"})
+            return self._send_json(400, {"type": "error", "error": {
+                "type": "invalid_request_error",
+                "message": "litellm.BadRequestError: AnthropicException - %s\n\nLiteLLM: model "
+                           "group '%s' failed with the error above. No fallback was attempted."
+                           % (inner, model)}, "request_id": str(uuid.uuid4())},
+                self._limit_headers())
         if self._routing_faults(fault, route, model, stream):
             return
         if fault == "slow-first-byte":
@@ -438,7 +509,8 @@ class Handler(BaseHTTPRequestHandler):
                 "id": "msg_mock_%s" % uuid.uuid4().hex[:16], "type": "message",
                 "role": "assistant", "model": model, "content": blocks,
                 "stop_reason": stop_reason, "stop_sequence": None,
-                "usage": {"input_tokens": in_tok, "output_tokens": out_tok}})
+                "usage": {"input_tokens": in_tok, "output_tokens": out_tok}},
+                self._limit_headers())
         self._stream(model, blocks, stop_reason, in_tok, out_tok, fault)
 
     # -- reply selection ------------------------------------------------
@@ -469,8 +541,11 @@ class Handler(BaseHTTPRequestHandler):
                              "name": tu["name"], "input": tu.get("input", {})}], "tool_use"
                 return [{"type": "text", "text": step.get("text", "Done.")}], "end_turn"
             choice = body.get("tool_choice") or {}
-            if choice.get("type") in ("any", "tool") and assistant_turns == 0:
-                tool = tools[0]
+            asked = next((t for t in tools if isinstance(t, dict) and t.get("name") and
+                          ("use the %s tool" % t["name"].lower()) in first_user.lower()), None)
+            if assistant_turns == 0 and (choice.get("type") in ("any", "tool") or
+                                         (choice.get("type", "auto") == "auto" and asked)):
+                tool = asked or tools[0]
                 if choice.get("type") == "tool":
                     tool = next((t for t in tools if t.get("name") == choice.get("name")), tool)
                 return [{"type": "tool_use", "id": "toolu_mock_%s" % uuid.uuid4().hex[:12],
@@ -524,6 +599,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.send_header("cache-control", "no-cache")
+        for k, v in self._limit_headers().items():
+            self.send_header(k, v)
+        if fault == "cached-replay":
+            # The gateway's response cache replays a stream: a ping first, then
+            # every event at once.
+            self.send_header("x-litellm-cache-key", "litellm.caching.caching:mock")
+            frames = [b'event: ping\ndata: {"type": "ping"}\n\n'] + \
+                [f for f, (n, _) in zip(frames, events) if n != "ping"]
+            fault = "buffered-stream"
         if fault == "buffered-stream":
             body = b"".join(frames)
             self.send_header("content-length", str(len(body)))

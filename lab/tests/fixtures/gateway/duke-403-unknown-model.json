@@ -1,0 +1,16 @@
+{
+  "captured": "2026-11-14, https://litellm.oit.duke.edu (LiteLLM 1.108.7), claude-haiku-5-5",
+  "request": "POST /v1/messages",
+  "status": 403,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "body": {
+    "error": {
+      "message": "The requested model 'claude-haiku-9-9' is not available for this API key, or the model name is invalid. Check the models available to you and try again.",
+      "type": "team_model_access_denied",
+      "param": "model",
+      "code": "403"
+    }
+  }
+}

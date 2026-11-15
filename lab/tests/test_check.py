@@ -61,7 +61,7 @@ class CheckGatewayTests(helpers.LabTestCase):
         r6 = self.assertStatus(res, 6, "WARN")
         self.assertIn("not in the list", r6.result)
         r7 = self.assertStatus(res, 7, "FAIL")
-        self.assertIn("not allowed to use the course model mock-main", r7.result)
+        self.assertIn("course model mock-main is not available to your key", r7.result)
         self.assertNotIn(REJECTED, r7.result)
         self.assertIn("the TA (test)", r7.todo)
 
@@ -82,11 +82,70 @@ class CheckGatewayTests(helpers.LabTestCase):
         self.assertIn("mock-main", r6.result)               # similar model named
 
     def test_rate_limit(self):
+        # The Duke gateway's real per-minute limit (fixture duke-429-tpm.json).
         self.set_fault("rate-limit")
         res = run(self.cfg, [4, 5, 6])
         r6 = self.assertStatus(res, 6, "FAIL")
-        self.assertIn("usage limit", r6.result)
-        self.assertIn("3600", r6.result)                     # retry-after shown
+        self.assertEqual(r6.data["outcome"], "rate_limit")
+        self.assertIn("20 requests and 40,000 tokens per minute", r6.result)
+        self.assertIn("52,397 tokens", r6.result)
+        self.assertIn("not your budget", r6.result)
+        self.assertNotIn("daily", r6.result)
+        self.assertIn("Wait one minute", r6.todo)
+        self.assertIn("/clear", r6.todo)
+
+    def test_budget_message_names_budget_and_reset(self):
+        self.set_fault("budget")
+        res = run(self.cfg, [4, 5, 6])
+        r6 = self.assertStatus(res, 6, "FAIL")
+        self.assertEqual(r6.data["outcome"], "budget")
+        self.assertIn("used up its budget of US$1.00 per day", r6.result)
+        self.assertIn("next reset 2026-11-15", r6.result)     # from /key/info
+        self.assertIn("dfir-lab replay", r6.todo)
+
+    def test_login_shows_the_key_limits(self):
+        r6 = self.assertStatus(run(self.cfg, [4, 5, 6]), 6, "PASS")
+        self.assertIn("key limits: 20 requests and 40,000 tokens per minute; US$1.00 per day",
+                      r6.result)
+
+    def test_cached_replay_is_not_called_buffering(self):
+        # The gateway's response cache replays a stream with a ping first and
+        # everything at once (fixture duke-200-stream-cached-replay.sse).
+        self.set_fault("cached-replay")
+        r8 = self.assertStatus(run(self.cfg, [8]), 8, "WARN")
+        self.assertIn("response cache", r8.result)
+
+    def test_check_prompts_are_never_identical(self):
+        seen = []
+        real = gateway.Gateway.request
+
+        def spy(gw, method, path, payload=None, extra_headers=None):
+            if payload:
+                seen.append(json.dumps(payload["messages"]))
+            return real(gw, method, path, payload, extra_headers)
+        with mock.patch.object(gateway.Gateway, "request", spy):
+            run(self.cfg, [7])
+            run(self.cfg, [7])
+        self.assertEqual(len(seen), 2)
+        self.assertNotEqual(seen[0], seen[1])
+
+    def test_tool_check_does_not_force_tool_choice(self):
+        sent = []
+        real = gateway.Gateway.messages
+
+        def spy(gw, payload):
+            sent.append(payload)
+            return real(gw, payload)
+        with mock.patch.object(gateway.Gateway, "messages", spy):
+            self.assertStatus(run(self.cfg, [9]), 9, "PASS")
+        self.assertEqual(sent[0]["tool_choice"], {"type": "auto"})
+
+    def test_provider_rejection_shows_the_providers_words(self):
+        self.set_fault("provider-reject")
+        r7 = self.assertStatus(run(self.cfg, [7]), 7, "FAIL")
+        self.assertIn("rejected part of the request", r7.result)
+        self.assertIn("output_config.effort: Input should be", r7.result)
+        self.assertNotIn("litellm.BadRequestError", r7.result)
 
     def test_server_error(self):
         self.set_fault("server-error")
@@ -186,14 +245,25 @@ class CheckGatewayTests(helpers.LabTestCase):
         self.assertIn("HTTP 401", r7.result)
         self.assertNotIn(REJECTED, r7.result)
 
-    def test_mock_uses_current_envelope(self):
+    def test_mock_uses_the_real_gateway_formats(self):
         gw = gateway.Gateway(self.base_url, self.mock_key)
-        self.set_fault("forbidden-model")
-        body = gw.messages({"model": "mock-main", "max_tokens": 1,
-                            "messages": [{"role": "user", "content": "x"}]}).json()
-        self.assertEqual(body["type"], "error")
-        self.assertEqual(body["error"]["type"], "permission_error")
-        self.assertEqual(body["error"]["litellm_error_type"], "key_model_access_denied")
+        msg = {"model": "mock-main", "max_tokens": 1,
+               "messages": [{"role": "user", "content": "x"}]}
+        for fault, fixture in (("forbidden-model", "duke-403-unknown-model"),
+                               ("wrong-key", "duke-401-wrong-key"),
+                               ("rate-limit", "duke-429-tpm")):
+            self.set_fault(fault)
+            res = gw.messages(msg)
+            want = helpers.gateway_fixture(fixture)
+            self.assertEqual(res.status, want["status"], fault)
+            got, exp = res.json(), want["body"]
+            self.assertEqual(sorted(got), sorted(exp), fault)
+            self.assertEqual(got["error"]["type"], exp["error"]["type"], fault)
+            self.assertNotIn("retry-after", res.headers, fault)
+        self.set_fault("none")
+        res = gw.messages(dict(msg, model="no-such-model"))   # unknown model: 403 like Duke
+        self.assertEqual(res.status, 403)
+        self.assertEqual(res.json()["error"]["type"], "team_model_access_denied")
 
     # -- review M2: a 200 is not automatically a pass -------------------------
     def test_html_200_login_page_is_not_a_pass(self):
@@ -403,7 +473,7 @@ class ClassifyTests(unittest.TestCase):
 
     def test_budget(self):
         res = self.r(400, {"error": {"message": "Budget has been exceeded! Current cost: 5"}})
-        self.assertEqual(classify(res, "m").kind, "limit")
+        self.assertEqual(classify(res, "m").kind, "budget")
 
     def test_models_404_is_warning(self):
         self.assertEqual(classify(self.r(404, {"detail": "Not Found"}), "m", "models").kind,
@@ -469,11 +539,13 @@ class ClassifyTests(unittest.TestCase):
         gateway_limit = self.envelope(429, "rate_limit_error", "Rate limit exceeded for api_key: "
                                       "sk-...abcd. Limit type: requests.", "throttling_error",
                                       {"retry-after": "30"})
-        self.assertEqual(classify(gateway_limit, "m").kind, "limit")
+        self.assertEqual(classify(gateway_limit, "m").kind, "rate_limit")
         self.assertEqual(classify(gateway_limit, "m").retry_after, "30")
         budget = self.envelope(429, "rate_limit_error", "Budget has been exceeded! Key=x "
                                "Current cost: 6, Max budget: 5", "budget_exceeded")
-        self.assertEqual(classify(budget, "m").kind, "limit")
+        self.assertEqual(classify(budget, "m").kind, "budget")
+        unknown = self.envelope(429, "rate_limit_error", "Too many requests")
+        self.assertEqual(classify(unknown, "m").kind, "limit")
         provider = self.r(429, {"error": {"message": "litellm.RateLimitError: RateLimitError: "
                                                      "AnthropicException - overloaded"}})
         self.assertEqual(classify(provider, "m").kind, "busy")
@@ -517,6 +589,75 @@ class ClassifyTests(unittest.TestCase):
         self.assertIn("cannot tell", what)
         self.assertIn("Not Found here [REDACTED-KEY]", what)
         self.assertNotIn(key, what)
+
+
+class RealGatewayFixtureTests(unittest.TestCase):
+    """Responses captured from the real Duke gateway on 2026-11-14 (key-free,
+    lab/tests/fixtures/gateway/), through the classifier and the messages a
+    student would see."""
+
+    def res(self, name):
+        d = helpers.gateway_fixture(name)
+        return HttpResult(status=d["status"], body=json.dumps(d["body"]).encode(),
+                          headers=d["headers"])
+
+    def kind(self, name, model="claude-haiku-5-5"):
+        return classify(self.res(name), model)
+
+    def test_wrong_and_missing_key_are_key_rejected(self):
+        for name in ("duke-401-wrong-key", "duke-401-no-key"):
+            self.assertEqual(self.kind(name).kind, "key_rejected", name)
+
+    def test_unknown_model_403_names_both_causes(self):
+        from dfir_lab.messages import render
+        out = self.kind("duke-403-unknown-model", "claude-haiku-9-9")
+        self.assertEqual(out.kind, "model_forbidden")
+        what, todo = render(out.kind, None, status=out.status, model="claude-haiku-9-9")
+        self.assertIn("not available to your key, or that no model has that name", what)
+        self.assertIn("HTTP 403", what)
+
+    def test_tpm_429_is_a_per_minute_limit_with_real_numbers(self):
+        from dfir_lab.messages import outcome_fields, render
+        out = self.kind("duke-429-tpm")
+        self.assertEqual(out.kind, "rate_limit")
+        self.assertEqual(out.retry_after, "")                 # the gateway sends none
+        self.assertEqual((out.limits.rpm, out.limits.tpm, out.limits.current_tpm),
+                         (20, 40000, 52397))
+        what, todo = render(out.kind, None, **outcome_fields(out))
+        self.assertIn("20 requests and 40,000 tokens per minute", what)
+        self.assertIn("52,397", what)
+        self.assertNotIn("daily", what.lower())
+
+    def test_provider_400s_are_request_rejected_with_inner_message(self):
+        cases = {"duke-400-bad-effort": "output_config.effort: Input should be",
+                 "duke-400-tool-choice-any": "tool_choice: type",
+                 "duke-400-unknown-beta": "anthropic-beta",
+                 "duke-400-max-tokens": "maximum allowed number of output tokens"}
+        for name, inner in cases.items():
+            out = self.kind(name)
+            self.assertEqual(out.kind, "request_rejected", name)
+            self.assertIn(inner, out.detail, name)
+            self.assertNotIn("LiteLLM: model group", out.detail, name)
+
+    def test_unknown_route_is_no_anthropic_route(self):
+        self.assertEqual(self.kind("duke-404-unknown-route").kind, "no_anthropic_route")
+
+    def test_key_info_limits(self):
+        info = helpers.gateway_fixture("duke-200-key-info")["body"]["info"]
+        lim = gateway.KeyLimits.from_info(info)
+        self.assertEqual((lim.rpm, lim.tpm, lim.max_budget, lim.budget_duration),
+                         (20, 40000, 1, "24h"))
+        self.assertTrue(lim.summary().startswith(
+            "20 requests and 40,000 tokens per minute; US$1.00 per day"))
+        self.assertIn("next reset 2026-11-1", lim.summary())
+
+    def test_cached_replay_stream_parses(self):
+        text = (helpers.FIXTURES / "gateway" / "duke-200-stream-cached-replay.sse").read_text()
+        blocks = [b for b in text.split("\n\n") if b.strip()]
+        names = [gateway._parse_sse_block(b)[0] for b in blocks]
+        self.assertEqual(names[0], "ping")
+        self.assertEqual(names[1], "message_start")
+        self.assertEqual(names[-1], "message_stop")
 
 
 class CheckCliTests(helpers.LabTestCase):
@@ -613,7 +754,21 @@ class SetupKeyOutcomeTests(helpers.LabTestCase):
 
     def test_limit(self):
         code, out = self.outcome("rate-limit")
-        self.assertIn("reached its usage limit", out)
+        self.assertEqual(code, 1)
+        self.assertIn("holding it back for a minute", out)
+        self.assertIn("20 requests and 40,000 tokens per minute", out)
+        self.assertNotIn("daily limit", out)
+
+    def test_budget(self):
+        code, out = self.outcome("budget")
+        self.assertEqual(code, 1)
+        self.assertIn("used up its budget", out)
+        self.assertIn("US$1.00 per day", out)
+
+    def test_working_key_shows_its_limits(self):
+        code, out = self.outcome()
+        self.assertEqual(code, 0, out)
+        self.assertIn("Your key's limits: 20 requests and 40,000 tokens per minute", out)
 
     def test_cooldown_is_not_a_daily_limit(self):
         # Review M1/P1: a deployment cooldown 429 made setup-key assert a daily limit.

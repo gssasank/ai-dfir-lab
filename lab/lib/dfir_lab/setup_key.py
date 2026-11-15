@@ -11,7 +11,9 @@ SAVED_WORKING = "Your key is saved and working."
 SAVED_UNREACHABLE = "Your key is saved, but the gateway cannot be reached right now, so the key could not be tested."
 REJECTED = "Your key is saved, but the gateway rejected it."
 MODEL_UNAVAILABLE = "Your key is saved and works, but the course model {model} is not available to it."
-LIMIT = "Your key is saved and valid, but it has reached its usage limit (the daily limit or a rate limit)."
+RATE_LIMIT = "Your key is saved and valid, but the gateway is holding it back for a minute (too many requests or tokens in the last minute), so the test could not finish."
+BUDGET = "Your key is saved and valid, but it has used up its budget until the next reset."
+LIMIT = "Your key is saved and valid, but it has reached one of its usage limits (a per-minute limit or its budget)."
 BUSY = "Your key is saved, but the AI service behind the gateway is busy or down right now, so the key could not be fully tested."
 OTHER = "Your key is saved, but testing it gave an unexpected error."
 
@@ -58,6 +60,10 @@ def test_key(cfg):
             if r.status == check.WARN and r7.status == check.PASS:
                 continue  # listed oddly, but the model answers: good enough
             return 1, MODEL_UNAVAILABLE.format(model=model), r.result, r.todo
+        if r.status == check.FAIL and kind == "rate_limit":
+            return 1, RATE_LIMIT, r.result, r.todo
+        if r.status == check.FAIL and kind == "budget":
+            return 1, BUDGET, r.result, r.todo
         if r.status == check.FAIL and kind == "limit":
             return 1, LIMIT, r.result, r.todo
         if r.status == check.FAIL and kind == "busy":
@@ -67,7 +73,12 @@ def test_key(cfg):
         if r.status == check.SKIP:
             continue
     if r7.status == check.PASS:
-        return 0, SAVED_WORKING, r7.result, ""
+        detail = r7.result
+        limits = (r6.data or {}).get("limits")
+        if limits:
+            summary = r6.result.split("; key limits: ", 1)[-1]
+            detail += "\nYour key's limits: %s." % summary
+        return 0, SAVED_WORKING, detail, ""
     return 1, OTHER, r7.result, r7.todo
 
 

@@ -13,7 +13,7 @@ curl -fsSLO https://raw.githubusercontent.com/<owner>/ai-dfir-lab/v<version>/dis
 
 | Path | What it is |
 |---|---|
-| `release.conf` | Every release setting: repository, version, pinned Claude Code, Protocol SIFT commit, gateway URL, model names, case id, kit file pattern, accepted kit SHA-256 values. |
+| `release.conf` | Every release setting: repository, version, pinned Claude Code, Protocol SIFT commit, gateway URL, model names, Claude Code effort level, case id, kit file pattern, accepted kit SHA-256 values. |
 | `bootstrap.sh.in` | The script template. `@@RELEASE_SETTINGS@@` is replaced by the build. |
 | `lab.conf.in` | Template for `/etc/dfir-lab/lab.conf`. `@NAME@` values come from `release.conf`; `@CLAUDE_BINARY@` is filled in on the VM. |
 | `case-overlay/<case id>/` | Files copied over the case kit: the case `CLAUDE.md`, `ticket.md`, `checkpoints.json`, replay recordings in `fallback/`. They ship with the script, so they can change without a new kit. |
@@ -59,6 +59,6 @@ Exit codes: 0 complete, 1 incomplete, 2 refused, 3 stopped by an error. Running 
 
 ## When the real case kit and repository owner are known
 
-1. `release.conf`: set `REPO_OWNER`; replace `CASE_KIT_SHA256` with the real kit's SHA-256 (several values, space separated, if more than one kit version is valid); adjust `CASE_KIT_PATTERN`, `CASE_TITLE`, `MODEL_MAIN`/`MODEL_SMALL` once the gateway names are confirmed; bump `VERSION`.
+1. `release.conf`: set `REPO_OWNER`; `CASE_KIT_SHA256` holds the real kit `szechuan-kit-0.1.0.zip` and, second, the stand-in kit used by the mock VM test; remove the stand-in hash before publishing. `MODEL_MAIN`/`MODEL_SMALL` (`claude-haiku-5-5`) and `CLAUDE_EFFORT` (`low`) were tested against the gateway on 2026-11-14. Bump `VERSION` for every published change.
 2. `case-overlay/szechuan/`: replace `ticket.md`, `checkpoints.json` (built with `dfir-lab-make-checkpoints` from a source that stays out of the repository) and the recordings in `fallback/`; review `CLAUDE.md`.
 3. `python3 bootstrap/build.py --check`, run `vmtest/Test-Bootstrap.ps1` with the real kit copied to `build/bootstrap/` (or adapt `$KitName`), commit `dist/bootstrap.sh`, tag `v<VERSION>`, push, and publish the printed command.

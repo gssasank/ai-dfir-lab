@@ -15,6 +15,7 @@ model_small = @MODEL_SMALL@
 
 [claude]
 binary = @CLAUDE_BINARY@
+effort = @CLAUDE_EFFORT@
 
 [case]
 id = @CASE_ID@

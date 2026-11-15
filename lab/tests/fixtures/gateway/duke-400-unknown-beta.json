@@ -1,0 +1,21 @@
+{
+  "captured": "2026-11-14, https://litellm.oit.duke.edu (LiteLLM 1.108.7), claude-haiku-5-5",
+  "request": "POST /v1/messages?beta=true",
+  "status": 400,
+  "headers": {
+    "content-type": "application/json",
+    "x-litellm-key-max-budget": "1.0",
+    "x-litellm-key-rpm-limit": "20",
+    "x-litellm-key-spend": "0.015304042499999998",
+    "x-litellm-key-tpm-limit": "40000",
+    "x-litellm-version": "1.108.7"
+  },
+  "body": {
+    "type": "error",
+    "error": {
+      "type": "invalid_request_error",
+      "message": "litellm.BadRequestError: AnthropicException - {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Unexpected value(s) `no-such-beta-2099-01-01` for the `anthropic-beta` header. Please consult our documentation at platform.claude.com/docs or try again without the header.\"},\"request_id\":\"req_011Ch3kDjgh7fJTZkA8D1ubS\"}\n\nLiteLLM: model group 'claude-haiku-5-5' failed with the error above. No fallback was attempted."
+    },
+    "request_id": "00000000-0000-0000-0000-000000000000"
+  }
+}

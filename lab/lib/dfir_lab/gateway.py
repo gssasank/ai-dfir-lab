@@ -283,6 +283,17 @@ class Gateway:
     def models(self):
         return self.request("GET", "/v1/models")
 
+    def key_info(self):
+        """The key's own budget and rate limits from LiteLLM's /key/info (a
+        key may read its own record; observed on the Duke gateway 2026-11-14).
+        Returns a KeyLimits or None. Costs no tokens."""
+        res = self.request("GET", "/key/info")
+        if res.status != 200:
+            return None
+        data = res.json()
+        info = data.get("info") if isinstance(data, dict) else None
+        return KeyLimits.from_info(info) if isinstance(info, dict) else None
+
     def messages(self, payload):
         return self.request("POST", "/v1/messages", payload)
 
@@ -364,6 +375,108 @@ def _parse_sse_block(block):
 
 
 # --------------------------------------------------------------------------
+# Key limits
+# --------------------------------------------------------------------------
+
+def _num(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return int(f) if f == int(f) else f
+
+
+@dataclass
+class KeyLimits:
+    """What the gateway enforces for one key. Any field may be None."""
+    rpm: object = None             # requests per minute
+    tpm: object = None             # tokens per minute (every input token counts, cached or not)
+    max_budget: object = None      # US dollars per budget period
+    budget_duration: str = ""      # e.g. "24h"
+    budget_reset_at: str = ""      # ISO time of the next reset
+    spend: object = None           # US dollars spent in the current period
+    current_tpm: object = None     # from a 429: tokens the gateway counted this minute
+    current_rpm: object = None
+
+    @classmethod
+    def from_info(cls, info):
+        return cls(rpm=_num(info.get("rpm_limit")), tpm=_num(info.get("tpm_limit")),
+                   max_budget=_num(info.get("max_budget")),
+                   budget_duration=str(info.get("budget_duration") or ""),
+                   budget_reset_at=str(info.get("budget_reset_at") or ""),
+                   spend=_num(info.get("spend")))
+
+    @classmethod
+    def from_response(cls, res, message=""):
+        """From LiteLLM's x-litellm-key-* headers (sent on successes and on
+        429s) and the numbers in a rate-limit message such as "current rpm: 2,
+        rpm limit: 20, current tpm: 52397, tpm limit: 40000"."""
+        h = res.headers or {}
+        lim = cls(rpm=_num(h.get("x-litellm-key-rpm-limit")),
+                  tpm=_num(h.get("x-litellm-key-tpm-limit")),
+                  max_budget=_num(h.get("x-litellm-key-max-budget")),
+                  spend=_num(h.get("x-litellm-key-spend")))
+        low = (message or "").lower()
+        for field_, rx in (("current_rpm", r"current rpm:\s*([0-9.]+)"),
+                           ("rpm", r"rpm limit:\s*([0-9.]+)"),
+                           ("current_tpm", r"current tpm:\s*([0-9.]+)"),
+                           ("tpm", r"tpm limit:\s*([0-9.]+)")):
+            m = re.search(rx, low)
+            if m:
+                setattr(lim, field_, _num(m.group(1)))
+        return lim
+
+    def merge(self, other):
+        """Fill empty fields from another KeyLimits (e.g. /key/info)."""
+        if other is None:
+            return self
+        for k in self.__dataclass_fields__:
+            if getattr(self, k) in (None, "") and getattr(other, k) not in (None, ""):
+                setattr(self, k, getattr(other, k))
+        return self
+
+    def reset_text(self):
+        """The next budget reset in the VM's local time, e.g.
+        '2026-11-15 00:00 EST', or ''."""
+        if not self.budget_reset_at:
+            return ""
+        import datetime as _dt
+        try:
+            t = _dt.datetime.fromisoformat(self.budget_reset_at.replace("Z", "+00:00"))
+        except ValueError:
+            return self.budget_reset_at
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=_dt.timezone.utc)
+        return t.astimezone().strftime("%Y-%m-%d %H:%M %Z").strip()
+
+    def per_minute_text(self):
+        bits = []
+        if self.rpm is not None:
+            bits.append("%s requests" % format(self.rpm, ","))
+        if self.tpm is not None:
+            bits.append("%s tokens" % format(self.tpm, ","))
+        return (" and ".join(bits) + " per minute") if bits else ""
+
+    def budget_text(self, with_spend=True):
+        if self.max_budget is None:
+            return ""
+        period = {"24h": "day", "1d": "day", "7d": "week", "30d": "month"}.get(
+            self.budget_duration, self.budget_duration)
+        out = ("US$%.2f per %s" % (self.max_budget, period)) if period else \
+            ("US$%.2f" % self.max_budget)
+        if with_spend and self.spend is not None:
+            out += " (US$%.4f used so far)" % self.spend
+        reset = self.reset_text()
+        if reset:
+            out += ", next reset %s" % reset
+        return out
+
+    def summary(self):
+        parts = [p for p in (self.per_minute_text(), self.budget_text()) if p]
+        return "; ".join(parts)
+
+
+# --------------------------------------------------------------------------
 # Classification
 # --------------------------------------------------------------------------
 #
@@ -376,7 +489,25 @@ def _parse_sse_block(block):
 #                    (litellm_error_type only when it adds information)
 #   other routes     {"error": {"message": "...", "type": "...", "param": ..., "code": "429"}}
 #   missing route    {"detail": "Not Found"}
-# The university gateway's real responses have never been sampled. To support
+# The Duke gateway (LiteLLM 1.108.7) was sampled on 2026-11-14 with a real key
+# (fixtures in tests/fixtures/gateway/). What it really returns:
+#   no key / wrong key   401 {"error": {"message": "Authentication Error, ...",
+#                        "type": "auth_error" | "token_not_found_in_db", "param", "code"}}
+#                        (OpenAI-style envelope even on /v1/messages)
+#   unknown or not-allowed model
+#                        403 {"error": {..., "type": "team_model_access_denied"}}
+#                        ("is not available for this API key, or the model name is invalid")
+#   per-minute limit     429 {"type": "error", "error": {"type": "rate_limit_error",
+#                        "message": "LiteLLM Rate Limit Handler for rate limit type = key.
+#                        Crossed TPM / RPM / Max Parallel Request Limit. current rpm: 2,
+#                        rpm limit: 20, current tpm: 52397, tpm limit: 40000, ..."}}
+#                        with no retry-after header
+#   provider rejection   400 {"type": "error", "error": {"type": "invalid_request_error",
+#                        "message": "litellm.BadRequestError: AnthropicException - {<the
+#                        provider's own error JSON>}\n\nLiteLLM: model group ..."}}
+#   missing route        404 {"detail": "Not Found"}
+# Not sampled: budget exhausted (that would have meant spending the key's budget).
+# To support
 # a newly captured response: add or adjust one step in classify() (structured
 # fields first, message text second) and add the captured body to
 # ClassifyTests in tests/test_check.py.
@@ -387,6 +518,7 @@ class Outcome:
     status: int = 0
     detail: str = ""
     retry_after: str = ""
+    limits: object = None     # KeyLimits for the rate_limit, budget and limit outcomes
 
 
 @dataclass
@@ -421,6 +553,32 @@ def error_info(res):
     return info
 
 
+_PROVIDER_JSON = re.compile(r"[a-z]*exception\s*-\s*(\{.*\})", re.I | re.S)
+
+
+def provider_message(message):
+    """The provider's own error text inside a LiteLLM wrapper such as
+    'litellm.BadRequestError: AnthropicException - {"type":"error","error":
+    {"type":"invalid_request_error","message":"..."}}\n\nLiteLLM: ...', or ''."""
+    m = _PROVIDER_JSON.search(message or "")
+    if not m:
+        return ""
+    raw = m.group(1)
+    # The JSON ends at one of the closing braces before LiteLLM's own trailer.
+    for end in range(len(raw), 0, -1):
+        if raw[end - 1] != "}":
+            continue
+        try:
+            data = json.loads(raw[:end])
+        except ValueError:
+            continue
+        err = data.get("error") if isinstance(data, dict) else None
+        if isinstance(err, dict) and err.get("message"):
+            return str(err["message"])
+        return ""
+    return ""
+
+
 def error_message(res):
     """Best-effort extraction of the error text a gateway returned (not
     redacted or shortened here; messages.render does both, in that order)."""
@@ -439,6 +597,10 @@ _MODEL_ACCESS = ("not allowed to access model", "can only access models",
 _BUSY = ("no deployments available", "no healthy deployments", "cooldown", "cooling down",
          "server_is_overloaded", "overloaded")
 _BUSY_TYPES = {"overloaded_error", "service_unavailable_error"}
+# LiteLLM's per-key limiter: requests, tokens or parallel requests per minute.
+# Not the budget.
+_RATE = ("rate limit handler", "crossed tpm", "tpm / rpm", "rpm limit:", "tpm limit:",
+         "max parallel request", "rate limit exceeded for api_key", "throttling_error")
 _BUDGET = ("budget has been exceeded", "exceededbudget", "over budget", "max budget",
            "max_budget", "spend limit", "insufficient_quota", "quota exceeded")
 _GATEWAY_AUTH_TYPES = {"token_not_found_in_db", "expired_key", "auth_error"}
@@ -451,7 +613,10 @@ _UNSUPPORTED = re.compile(
     r"|unsupported (param|field|argument|beta|value|content)|unknown (param|field|argument)"
     r"|unrecognized (request )?(param|field|argument)|extra inputs are not permitted"
     r"|unexpected keyword|\b(param|parameter|field|argument|beta)s?\b[^.\n]{0,60}"
-    r"\bnot (supported|permitted|allowed)\b")
+    r"\bnot (supported|permitted|allowed)\b"
+    # The provider's own validation messages, relayed by the gateway:
+    r"|input should be|unexpected value\(s\)|(is|are) not supported for this model"
+    r"|maximum allowed number of output tokens")
 # A provider's own exception named in a LiteLLM message, e.g.
 # "litellm.AuthenticationError: AnthropicException - invalid x-api-key".
 _PROVIDER_EXC = re.compile(r"\b(?!proxy|http)[a-z0-9_]*[a-z]exception\b")
@@ -473,11 +638,17 @@ def classify(res, model=None, route="messages"):
     low = info.text
     types = {t for t in (info.type, info.litellm_type) if t}
     retry = res.headers.get("retry-after", "")
+    inner = provider_message(info.message)
 
-    def out(kind):
-        return Outcome(kind=kind, status=s, detail=info.message, retry_after=retry)
+    def out(kind, detail=None):
+        o = Outcome(kind=kind, status=s, detail=info.message if detail is None else detail,
+                    retry_after=retry)
+        if kind in ("rate_limit", "budget", "limit"):
+            o.limits = KeyLimits.from_response(res, info.message)
+        return o
 
     # Model access denied at any layer (key, team, user, org, project, ...).
+    # The Duke gateway answers the same way for a model name it does not know.
     if any(t.endswith("_model_access_denied") for t in types) or _has(low, _MODEL_ACCESS):
         return out("model_forbidden")
     # The service behind the gateway is busy or down: no healthy deployment,
@@ -485,7 +656,7 @@ def classify(res, model=None, route="messages"):
     if s in (503, 529) or types & _BUSY_TYPES or _has(low, _BUSY):
         return out("busy")
     if "budget_exceeded" in types or _has(low, _BUDGET) or ("budget" in low and "exceed" in low):
-        return out("limit")
+        return out("budget")
     if s in (401, 403):
         gateway_auth = bool(types & _GATEWAY_AUTH_TYPES) or _has(low, _GATEWAY_AUTH)
         if not gateway_auth and _PROVIDER_EXC.search(low):
@@ -494,14 +665,18 @@ def classify(res, model=None, route="messages"):
             return out("other")             # some other permission (e.g. a tool), not the key
         return out("key_rejected")
     if s == 429:
+        if _has(low, _RATE):
+            return out("rate_limit")        # the key's per-minute limits (the real Duke format)
         if _PROVIDER_EXC.search(low) and not retry:
             return out("busy")              # the provider throttled the gateway
         return out("limit")
     if s in (400, 422):
-        if _UNSUPPORTED.search(low):
-            return out("request_rejected")
         if _has(low, _MODEL_UNKNOWN):
             return out("model_unknown")
+        if _UNSUPPORTED.search(low) or (inner and _PROVIDER_EXC.search(low)):
+            # The gateway or the provider behind it refused a field or a value;
+            # show the provider's own sentence when there is one.
+            return out("request_rejected", inner or info.message)
         return out("other")
     if s == 404:
         if route == "models":

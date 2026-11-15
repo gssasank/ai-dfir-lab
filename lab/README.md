@@ -39,7 +39,8 @@ merges the course settings into `~/.claude/settings.json` (or
 `$CLAUDE_CONFIG_DIR/settings.json`). If that fails, `start` and readiness
 check 10 stop with exit code 3 and do not run Claude Code. The merge:
 
-- sets `apiKeyHelper`, the gateway URL and models, `IS_DEMO=1` (skips the
+- sets `apiKeyHelper`, the gateway URL and models, the effort level from
+  `[claude] effort` (`CLAUDE_CODE_EFFORT_LEVEL`), `IS_DEMO=1` (skips the
   first-run theme screen),
   `CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1` (no clone of the
   official plugin marketplace on the first interactive start), and the deny
@@ -50,7 +51,13 @@ check 10 stop with exit code 3 and do not run Claude Code. The merge:
   removes them from Claude Code's environment, and a `lab.conf` whose
   `extra_env` sets one of them is refused;
 - replaces any copy of the guard hook entry with another matcher or failure
-  policy.
+  policy;
+- leaves out features the lab never uses, because the Duke gateway counts
+  every token of every request (cached or not) against each key's
+  tokens-per-minute limit: the `Workflow`, `ScheduleWakeup`, `ReportFindings`
+  and `ListAgents` tools are denied (a denied tool is not sent at all), and
+  `CLAUDE_CODE_DISABLE_WORKFLOWS`, `_CRON`, `_BUNDLED_SKILLS`, `_ADVISOR_TOOL`,
+  `_ARTIFACT` and `_TERMINAL_TITLE` are set to `1`.
 
 `start` also marks the case folder as trusted in Claude Code's own state file
 (`~/.claude.json`, or `$CLAUDE_CONFIG_DIR/.claude.json`), so the first
@@ -92,17 +99,21 @@ curl -X POST http://127.0.0.1:8765/_mock/reset
 ```
 
 Faults: `wrong-key`, `forbidden-model`, `unknown-model-404`, `unknown-model-400`,
-`rate-limit`, `server-error`, `slow-first-byte`, `buffered-stream`,
-`dropped-stream`, `no-anthropic-route`, `unsupported-param`,
-`no-healthy-deployments`, `cooldown`, `upstream-auth`. Errors use the envelope
-current LiteLLM returns (`{"type": "error", "error": {"type", "message",
-"litellm_error_type"}}` on `/v1/messages`). Scenarios for real Claude Code are
-in `tools/mock-gateway/scenarios/` (`readiness.json` satisfies check 10). The
-request log never contains the configured key.
+`rate-limit`, `budget`, `server-error`, `slow-first-byte`, `buffered-stream`,
+`dropped-stream`, `cached-replay`, `no-anthropic-route`, `unsupported-param`,
+`provider-reject`, `no-healthy-deployments`, `cooldown`, `upstream-auth`.
+Scenarios for real Claude Code are in `tools/mock-gateway/scenarios/`
+(`readiness.json` satisfies check 10). The request log never contains the
+configured key.
 
-The real gateway's error responses have not been sampled yet. When they are,
-add each captured body to `ClassifyTests` in `lab/tests/test_check.py` and
-adjust `classify()` in `lab/lib/dfir_lab/gateway.py`.
+The wrong-key, forbidden/unknown-model, rate-limit, provider-reject and
+cached-replay replies copy what the real Duke gateway returned on 2026-11-14
+(LiteLLM 1.108.7). The captured bodies, without the key, are in
+`lab/tests/fixtures/gateway/` and are tested in `RealGatewayFixtureTests`
+(`lab/tests/test_check.py`). The other faults, `budget` included, follow
+LiteLLM's source and have not been seen from the real gateway. To support a
+newly captured response, add it to that folder and test, and adjust
+`classify()` in `lab/lib/dfir_lab/gateway.py`.
 
 ## Try each command locally
 

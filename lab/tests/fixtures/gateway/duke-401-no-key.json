@@ -1,0 +1,16 @@
+{
+  "captured": "2026-11-14, https://litellm.oit.duke.edu (LiteLLM 1.108.7), claude-haiku-5-5",
+  "request": "POST /v1/messages",
+  "status": 401,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "body": {
+    "error": {
+      "message": "Authentication Error, No api key passed in.",
+      "type": "auth_error",
+      "param": "None",
+      "code": "401"
+    }
+  }
+}

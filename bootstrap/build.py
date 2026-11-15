@@ -110,6 +110,10 @@ def read_release(path):
                          "(64 lowercase hex), got %r. Build the stand-in kit with "
                          "`build.py standin-kit` and paste its hash, or paste the real kit's."
                          % values["CASE_KIT_SHA256"])
+    values.setdefault("CLAUDE_EFFORT", "")
+    if values["CLAUDE_EFFORT"] not in ("", "low", "medium", "high", "xhigh", "max", "auto"):
+        raise BuildError("release.conf: CLAUDE_EFFORT must be low, medium, high, xhigh, max, "
+                         "auto or empty, got %r" % values["CLAUDE_EFFORT"])
     vparts = tuple(int(x) for x in values["CLAUDE_CODE_VERSION"].split("."))
     if vparts < (2, 1, 295):
         raise BuildError("release.conf: the toolkit needs Claude Code 2.1.295 or later")
@@ -149,8 +153,8 @@ def payload_members(rel):
             members["lab/" + p.relative_to(LAB).as_posix()] = p.read_bytes()
 
     tpl = (HERE / "lab.conf.in").read_text(encoding="utf-8")
-    for key in ("VERSION", "GATEWAY_BASE_URL", "MODEL_MAIN", "MODEL_SMALL", "CASE_ID",
-                "CASE_TITLE"):
+    for key in ("VERSION", "GATEWAY_BASE_URL", "MODEL_MAIN", "MODEL_SMALL", "CLAUDE_EFFORT",
+                "CASE_ID", "CASE_TITLE"):
         tpl = tpl.replace("@%s@" % key, rel[key])
     left = sorted(set(re.findall(r"@[A-Z_]+@", tpl)) - {"@CLAUDE_BINARY@"})
     if left:

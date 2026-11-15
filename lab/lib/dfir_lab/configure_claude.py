@@ -21,7 +21,8 @@ who owns the key).
 
 Setting names verified against code.claude.com/docs on 2026-11-13:
 apiKeyHelper, env, permissions.deny (Read(~/path/**), bare WebFetch /
-WebSearch), hooks.PreToolUse [{matcher, hooks:[{type, command, timeout,
+WebSearch, and bare tool names, which also leave the tool out of the
+request), hooks.PreToolUse [{matcher, hooks:[{type, command, timeout,
 onFailure}]}].
 """
 
@@ -48,7 +49,10 @@ BUILTIN_FRAGMENT = {
     "apiKeyHelper": "@LIBEXEC@/key-helper",
     "env": {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "DISABLE_AUTOUPDATER": "1"},
     "permissions": {"deny": ["Read(~/.config/dfir-lab/**)", "Read(~/.config/dfir-lab)",
-                             "Edit(~/.config/dfir-lab/**)", "WebFetch", "WebSearch"]},
+                             "Edit(~/.config/dfir-lab/**)", "WebFetch", "WebSearch",
+                             # Tools the lab never uses; a denied tool is left out of every
+                             # request (measured 2026-11-14: ~5,900 fewer tokens per request).
+                             "Workflow", "ScheduleWakeup", "ReportFindings", "ListAgents"]},
     "hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
         {"type": "command", "command": "@LIBEXEC@/pretool-guard", "timeout": 10,
          "onFailure": "block"}]}]},

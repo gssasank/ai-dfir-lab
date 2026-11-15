@@ -288,6 +288,38 @@ class MergeTests(helpers.LabTestCase):
         self.assertEqual(process_env(Config(), base={})[
             "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL"], "1")
 
+    def test_effort_level_from_lab_conf(self):
+        # Gateway proof 2026-11-14: CLAUDE_CODE_EFFORT_LEVEL=low made Claude Code
+        # 2.1.322 send output_config.effort "low".
+        self.apply()
+        self.assertNotIn("CLAUDE_CODE_EFFORT_LEVEL", self.load()["env"])   # default: unset
+        self.write_conf({("claude", "effort"): "low"})
+        cc.apply(Config(), libexec=self.libexec)
+        self.assertEqual(self.load()["env"]["CLAUDE_CODE_EFFORT_LEVEL"], "low")
+        self.assertEqual(claude_env.process_env(Config(), base={})["CLAUDE_CODE_EFFORT_LEVEL"],
+                         "low")
+
+    def test_bad_effort_level_is_config_error(self):
+        self.write_conf({("claude", "effort"): "turbo"})
+        with self.assertRaises(ConfigError) as cm:
+            cc.apply(Config(), libexec=self.libexec)
+        self.assertIn("[claude] effort", cm.exception.what)
+
+    def test_unused_tools_are_left_out_of_requests(self):
+        # Gateway proof 2026-11-14: every token of every request counts against the
+        # key's per-minute limit, so tools the lab never uses are switched off.
+        self.apply()
+        data = self.load()
+        for tool in ("Workflow", "ScheduleWakeup", "ReportFindings", "ListAgents"):
+            self.assertIn(tool, data["permissions"]["deny"])
+        for name, value in claude_env.LOAD_REDUCTION_ENV.items():
+            self.assertEqual(data["env"][name], value, name)
+        env = claude_env.process_env(Config(), base={})
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_TERMINAL_TITLE"], "1")
+        # Tools students use stay available.
+        for tool in ("Bash", "Read", "Edit", "Write", "Skill", "Agent"):
+            self.assertNotIn(tool, data["permissions"]["deny"])
+
     def test_trust_case_folder(self):
         gpath = self.claude_dir / ".claude.json"
         self.claude_dir.mkdir()

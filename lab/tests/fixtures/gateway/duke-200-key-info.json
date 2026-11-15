@@ -1,0 +1,28 @@
+{
+  "captured": "2026-11-14, https://litellm.oit.duke.edu (LiteLLM 1.108.7), claude-haiku-5-5",
+  "request": "GET /key/info",
+  "status": 200,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "body": {
+    "key": "<sha256 of the key, removed>",
+    "info": {
+      "key_name": "sk-...abcd",
+      "spend": 3.99e-05,
+      "expires": "2027-03-14T23:51:12.016000+00:00",
+      "models": [
+        "all-team-models"
+      ],
+      "max_parallel_requests": 40,
+      "tpm_limit": 40000,
+      "rpm_limit": 20,
+      "tpd_limit": null,
+      "max_budget": 1.0,
+      "budget_duration": "24h",
+      "budget_reset_at": "2026-11-15T05:00:00+00:00",
+      "soft_budget_cooldown": false,
+      "status": "active"
+    }
+  }
+}

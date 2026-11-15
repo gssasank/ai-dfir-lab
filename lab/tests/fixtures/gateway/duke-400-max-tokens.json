@@ -1,0 +1,21 @@
+{
+  "captured": "2026-11-14, https://litellm.oit.duke.edu (LiteLLM 1.108.7), claude-haiku-5-5",
+  "request": "POST /v1/messages",
+  "status": 400,
+  "headers": {
+    "content-type": "application/json",
+    "x-litellm-key-max-budget": "1.0",
+    "x-litellm-key-rpm-limit": "20",
+    "x-litellm-key-spend": "0.015304042499999998",
+    "x-litellm-key-tpm-limit": "40000",
+    "x-litellm-version": "1.108.7"
+  },
+  "body": {
+    "type": "error",
+    "error": {
+      "type": "invalid_request_error",
+      "message": "litellm.BadRequestError: AnthropicException - {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"max_tokens: 10000000 > 128000, which is the maximum allowed number of output tokens for claude-haiku-5-5\"},\"request_id\":\"req_011Ch3kDoKihkjFHZuyQidxn\"}\n\nLiteLLM: model group 'claude-haiku-5-5' failed with the error above. No fallback was attempted."
+    },
+    "request_id": "00000000-0000-0000-0000-000000000000"
+  }
+}

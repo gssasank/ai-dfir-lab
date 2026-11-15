@@ -18,7 +18,8 @@ from pathlib import Path
 from . import casekit, configure_claude, fsutil, keystore, paths, readiness, ui
 from .claude_env import find_claude, process_env, require_min_version
 from .errors import ConfigError, LabError, UsageError
-from .gateway import Gateway, classify, model_ids, probe_network, similar_models, usage_tokens
+from .gateway import (Gateway, KeyLimits, classify, model_ids, probe_network, similar_models,
+                      usage_tokens)
 from .messages import CANNOT_REACH, outcome_fields, render
 from .redact import redact
 
@@ -77,7 +78,18 @@ class Ctx:
         if self._gw is not None and self._gw.last_date:
             self.date_header = self._gw.last_date
 
+    def key_limits(self):
+        """The key's limits from /key/info, fetched once (None if unavailable)."""
+        if not hasattr(self, "_limits"):
+            try:
+                self._limits = self.gw.key_info() if self.key else None
+            except Exception:  # noqa: BLE001 - informational only
+                self._limits = None
+        return self._limits
+
     def failure(self, cid, name, outcome, **extra):
+        if outcome.kind in ("rate_limit", "budget", "limit"):
+            outcome.limits = (outcome.limits or KeyLimits()).merge(self.key_limits())
         f = outcome_fields(outcome, self.net)
         f.setdefault("host", self.gw.host)
         f.setdefault("port", self.gw.port)
@@ -386,9 +398,16 @@ def check_login(ctx):
         what, todo = render("model_missing", cfg, similar=similar)
         data["outcome"] = "model_missing"
         return Result(6, "Gateway login", WARN, what, todo, data)
+    limits = ctx.key_limits()
+    text = ""
+    if limits is not None and limits.summary():
+        text = "; key limits: %s" % limits.summary()
+        data["limits"] = {k: getattr(limits, k) for k in ("rpm", "tpm", "max_budget",
+                                                          "budget_duration", "budget_reset_at",
+                                                          "spend")}
     return Result(6, "Gateway login", PASS,
-                  "key accepted; %d models available, including %s" % (len(ids), cfg.model_main),
-                  "", data)
+                  "key accepted; %d models available, including %s%s" % (
+                      len(ids), cfg.model_main, text), "", data)
 
 
 def _snippet(text, n=300):
@@ -398,8 +417,12 @@ def _snippet(text, n=300):
 
 
 def _text_payload(cfg, prompt, max_tokens):
+    # A fresh nonce in every prompt: the Duke gateway caches responses, and a
+    # repeated identical request comes back from that cache (a replayed
+    # stream arrives all at once, with a ping first), which tests nothing.
     return {"model": cfg.model_main, "max_tokens": max_tokens,
-            "messages": [{"role": "user", "content": prompt}]}
+            "messages": [{"role": "user", "content": "%s (check %s)" % (
+                prompt, os.urandom(4).hex())}]}
 
 
 def check_model(ctx):
@@ -439,10 +462,13 @@ def check_stream(ctx):
             what, todo = render("stream_dropped", cfg, detail=res.net_detail or "connection closed")
             return Result(8, "Streaming", FAIL, what, todo)
         return ctx.failure(8, "Streaming", classify(res, cfg.model_main, route="messages"))
-    names = [e[0] for e in res.events]
+    # Anthropic streams may carry "ping" events anywhere (the gateway's
+    # response cache even replays one first); they are not part of the message.
+    events = [e for e in res.events if e[0] != "ping"]
+    names = [e[0] for e in events]
     deltas = sum(1 for n in names if n == "content_block_delta")
     tin = tout = 0
-    for name, d, _ in res.events:
+    for name, d, _ in events:
         if name == "message_start" and isinstance(d, dict):
             a, b = usage_tokens(d.get("message", {}))
             tin += a
@@ -460,20 +486,27 @@ def check_stream(ctx):
         return Result(8, "Streaming", FAIL, what, todo, data)
     # Every event must carry a JSON object whose type matches the event name
     # (review M2: empty or invalid events used to pass).
-    invalid = [n for n, d, _ in res.events if not isinstance(d, dict) or d.get("type") != n]
+    invalid = [n for n, d, _ in events if not isinstance(d, dict) or d.get("type") != n]
     if invalid:
         what, todo = render("bad_reply", cfg, detail="%d of %d streamed events were empty or "
                             "not valid JSON (first: %s)" % (len(invalid), len(names), invalid[0]))
         return Result(8, "Streaming", FAIL, what, todo, data)
-    text_deltas = [d for n, d, _ in res.events if n == "content_block_delta"
+    text_deltas = [d for n, d, _ in events if n == "content_block_delta"
                    and isinstance(d.get("delta"), dict) and d["delta"].get("type") == "text_delta"
                    and d["delta"].get("text")]
     if not text_deltas:
         what, todo = render("bad_reply", cfg, detail="the streamed reply contained no text")
         return Result(8, "Streaming", FAIL, what, todo, data)
     ctx.add_tokens((tin, tout))
-    gap = (res.t_stop or 0) - (res.t_first or 0)
+    gap = (events[-1][2] if events else 0) - (events[0][2] if events else 0)
     data["spread_s"] = round(gap, 3)
+    if "x-litellm-cache-key" in res.headers:
+        # Served from the gateway's response cache: it says nothing about
+        # whether live replies stream, so do not judge buffering from it.
+        return Result(8, "Streaming", WARN,
+                      "The gateway answered from its response cache, so live streaming could "
+                      "not be tested this time (%d events)." % len(names),
+                      "Run the check again.", data)
     if deltas >= 3 and gap < BUFFER_GAP_S:
         what, todo = render("stream_buffered", cfg)
         return Result(8, "Streaming", FAIL, what, todo, data)
@@ -504,7 +537,10 @@ def check_tool_use(ctx):
     payload = _text_payload(cfg, "What time is it on the case clock in UTC? Use the "
                                  "get_case_clock tool.", 200)
     payload["tools"] = [CHECK_TOOL]
-    payload["tool_choice"] = {"type": "any"}
+    # "auto", not "any": Claude Sonnet 5.5, Opus 5.5 and Fable 5.1/5.2 reject a forced
+    # tool_choice with HTTP 400 (seen on the Duke gateway, 2026-11-14). The prompt
+    # asks for the tool; Claude Code itself always sends "auto".
+    payload["tool_choice"] = {"type": "auto"}
     res = ctx.gw.messages(payload)
     ctx.note_date()
     out = classify(res, cfg.model_main, route="messages")

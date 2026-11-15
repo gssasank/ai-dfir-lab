@@ -32,6 +32,8 @@ DEFAULTS = {
         "binary": "claude",
         "max_turns_readiness": "6",
         "readiness_timeout_s": "180",
+        # Claude Code effort level (CLAUDE_CODE_EFFORT_LEVEL); empty = Claude Code's default.
+        "effort": "",
         "extra_env": "",
     },
     "case": {
@@ -62,6 +64,8 @@ REQUIRED = {
 }
 
 AUTH_STYLES = ("bearer", "x-api-key", "both")
+# Values CLAUDE_CODE_EFFORT_LEVEL accepts (code.claude.com/docs/en/env-vars, read 2026-11-14).
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max", "auto")
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -203,6 +207,16 @@ class Config:
     @property
     def claude_binary(self):
         return self.get("claude", "binary") or "claude"
+
+    @property
+    def effort(self):
+        value = self.get("claude", "effort").lower()
+        if value and value not in EFFORT_LEVELS:
+            raise ConfigError(
+                "The setting [claude] effort in %s must be one of %s (or empty), not %r."
+                % (self.path, ", ".join(EFFORT_LEVELS), value),
+                "Tell the TA; the settings file needs to be fixed.")
+        return value
 
     @property
     def extra_env(self):

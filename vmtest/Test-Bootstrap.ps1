@@ -30,7 +30,7 @@
   In mock mode the guest maps the real gateway's host name to 127.0.0.1, so the
   guest never contacts it.
 
-  -Gateway real -KeyFile <path>: no mock; uses the real gateway settings and a key
+  -Gateway real -KeyFile <path> (use -RunName gw-<x>): no mock; uses the real gateway settings and a key
   read from a file on this host (copied into the guest as a file, stored with
   setup-key --from-stdin, then deleted). The key never appears in console output
   or collected files: every guest text is redacted and the collected files are
@@ -42,7 +42,8 @@
   ./Test-Bootstrap.ps1 -Gateway real -KeyFile C:\secure\duke-key.txt
 #>
 param(
-    [ValidatePattern('^bootstrap-[A-Za-z0-9._-]{1,40}$')]
+    # bootstrap-<x> for mock runs, gw-<x> for runs against the real gateway.
+    [ValidatePattern('^(bootstrap|gw)-[A-Za-z0-9._-]{1,40}$')]
     [string]$RunName = ('bootstrap-' + (Get-Date -Format 'MMdd-HHmmss')),
     [ValidateSet('mock', 'real')][string]$Gateway = 'mock',
     [string]$KeyFile,
@@ -61,7 +62,11 @@ $Repo = Split-Path $PSScriptRoot
 $OutDir = Join-Path $Repo "build\vmtest\$RunName"
 $GuestDir = '/tmp/dfir-test'
 $CaseId = 'szechuan'
-$KitHost = if ($KitPath) { [IO.Path]::GetFullPath($KitPath) } else { Join-Path $Repo 'build\bootstrap\szechuan-kit-standin.zip' }
+# Resolve a relative -KitPath / -KeyFile against PowerShell's current location.
+# ([IO.Path]::GetFullPath uses the process directory, which differs: the first
+# real-gateway run failed on that.)
+$KitHost = if ($KitPath) { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($KitPath) } else { Join-Path $Repo 'build\bootstrap\szechuan-kit-standin.zip' }
+if ($KeyFile) { $KeyFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($KeyFile) }
 $KitName = [IO.Path]::GetFileName($KitHost)
 $VmA = "$RunName-a"
 $VmB = "$RunName-b"
@@ -287,7 +292,10 @@ jq -r --arg url "@URL@" '
   "ours_deny_websearch=\((.permissions.deny // []) | index("WebSearch") != null)",
   "ours_base_url=\(.env.ANTHROPIC_BASE_URL == $url)",
   "ours_marketplace_off=\(.env.CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL == "1")",
-  "ours_is_demo=\(.env.IS_DEMO == "1")"' "$f"
+  "ours_is_demo=\(.env.IS_DEMO == "1")",
+  "ours_effort_low=\(.env.CLAUDE_CODE_EFFORT_LEVEL == "low")",
+  "ours_model_haiku=\(.env.ANTHROPIC_MODEL == "claude-haiku-5-5" or .env.ANTHROPIC_MODEL == "mock-main")",
+  "ours_deny_unused_tools=\((.permissions.deny // []) | index("Workflow") != null and index("ScheduleWakeup") != null)"' "$f"
 echo "psift_settings_local=$([ -f $HOME/.claude/settings.local.json ] && echo true || echo false)"
 '@ -replace '@URL@', $BaseUrl
     G $Vm $q -Save $Save
@@ -312,7 +320,7 @@ try {
         $script:Sha = ((Get-Content -LiteralPath (Join-Path $Repo 'dist\bootstrap.sh.sha256') -Raw) -split '\s+')[0]
         $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $Repo 'dist\bootstrap.sh')).Hash.ToLower()
         Check ($actual -eq $script:Sha) "dist/bootstrap.sh matches dist/bootstrap.sh.sha256 ($actual)"
-        Check (Test-Path -LiteralPath $KitHost) "stand-in kit exists ($KitHost)"
+        Check (Test-Path -LiteralPath $KitHost) "case kit exists ($KitHost)"
         $script:Server = Start-FileServer $HostAddress $Port @{ '/dist/bootstrap.sh' = (Join-Path $Repo 'dist\bootstrap.sh') }
         $script:StudentCommand = "curl -fsSLO http://$HostAddress`:$Port/dist/bootstrap.sh && echo `"$($script:Sha)  bootstrap.sh`" | sha256sum -c && bash bootstrap.sh"
         Say "  serving dist/bootstrap.sh on http://$HostAddress`:$Port"
@@ -338,17 +346,20 @@ try {
 set -u
 c=/cases/szechuan
 r() { dfir-lab check --only 3 --json --no-gui | jq -r '.results[0].status + " " + .results[0].result'; }
+# The first evidence file the kit's own manifest lists (works for the stand-in and the real kit).
+ev=$c/$(awk '$2 ~ /^evidence\// {print $2; exit}' $c/MANIFEST.sha256)
+echo "evidence file used: $ev"
 echo "baseline: $(r)"
-sudo cp -p $c/evidence/security-events.csv /tmp/ev.bak && printf 'x' | sudo tee -a $c/evidence/security-events.csv >/dev/null
+sudo cp -p "$ev" /tmp/ev.bak && printf 'x' | sudo tee -a "$ev" >/dev/null
 echo "kit file changed: $(r)"
-sudo cp -p /tmp/ev.bak $c/evidence/security-events.csv
+sudo cp -p /tmp/ev.bak "$ev"
 sudo cp -p $c/CLAUDE.md /tmp/cl.bak && printf 'x' | sudo tee -a $c/CLAUDE.md >/dev/null
 echo "overlay file changed: $(r)"
 sudo cp -p /tmp/cl.bak $c/CLAUDE.md
 echo "restored: $(r)"
-echo "student can write evidence: $( [ -w $c/evidence/security-events.csv ] && echo yes || echo no )"
+echo "student can write evidence: $( [ -w "$ev" ] && echo yes || echo no )"
 echo "student can write analysis: $( [ -w $c/analysis ] && echo yes || echo no )"
-stat -c '%U:%G %a %n' $c $c/evidence $c/evidence/* $c/CLAUDE.md $c/analysis $c/MANIFEST.lab.sha256
+stat -c '%U:%G %a %n' $c $c/evidence "$ev" $c/CLAUDE.md $c/analysis $c/MANIFEST.lab.sha256
 '@ -Save "$VmA\manifest-detection.txt"
         Say ($t.Text -replace '(?m)^', '    ')
         Check ($t.Text -match 'baseline: PASS') 'manifest check passes after install'
@@ -479,6 +490,8 @@ mkdir -p /tmp/dfir-test/probe && cd /tmp/dfir-test/probe
   --output-format json --permission-mode dontAsk --allowedTools Bash --no-session-persistence < /dev/null 2>&1 | head -c 4000
 '@ -Timeout 400 -Save "$VmA\guard-probe.txt"
             Check (-not $Secret -or -not $gp.Text.Contains('[REDACTED-KEY]')) 'the key did not appear in Claude Code output'
+            # The run must show the guard at work, not merely a model that declined.
+            Check ($gp.Text -match '"permission_denials":\[\{' -and $gp.Text -match 'duke-api-key') 'the guard hook denied the key read (permission_denials names the command)'
         }
     }
 

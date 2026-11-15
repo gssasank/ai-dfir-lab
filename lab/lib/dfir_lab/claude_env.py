@@ -8,7 +8,9 @@ CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, DISABLE_AUTOUPDATER, IS_DEMO
 ("skips onboarding"), CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL
 ("Set to 1 to disable automatic registration of the official plugin
 marketplace ... usually during a machine's first interactive launch";
-CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC does not cover it), ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN and the
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC does not cover it), CLAUDE_CODE_EFFORT_LEVEL
+and the CLAUDE_CODE_DISABLE_* names in LOAD_REDUCTION_ENV (checked 2026-11-14),
+ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN and the
 provider selectors CLAUDE_CODE_USE_BEDROCK / _VERTEX / _FOUNDRY /
 _ANTHROPIC_AWS / _MANTLE. The key is never placed in the environment;
 Claude Code gets it from the apiKeyHelper setting.
@@ -30,6 +32,21 @@ CREDENTIAL_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 PROVIDER_VARS = ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
                  "CLAUDE_CODE_USE_ANTHROPIC_AWS", "CLAUDE_CODE_USE_MANTLE")
 CONFLICTING_VARS = CREDENTIAL_VARS + PROVIDER_VARS
+
+# Load reduction (measured against the Duke gateway on 2026-11-14, see
+# research/2026-11-14-gateway-proof.md). The gateway counts every token of
+# every request, cached or not, against a per-key tokens-per-minute limit, so
+# whatever Claude Code sends with each request matters. These remove features
+# the lab never uses; names checked in code.claude.com/docs/en/env-vars on
+# 2026-11-14. The matching tool names are denied in the settings fragment.
+LOAD_REDUCTION_ENV = {
+    "CLAUDE_CODE_DISABLE_WORKFLOWS": "1",       # Workflow tool (~2,300 tokens per request)
+    "CLAUDE_CODE_DISABLE_CRON": "1",            # /loop and scheduled tasks
+    "CLAUDE_CODE_DISABLE_BUNDLED_SKILLS": "1",  # coding skills listed in every request
+    "CLAUDE_CODE_DISABLE_ADVISOR_TOOL": "1",
+    "CLAUDE_CODE_DISABLE_ARTIFACT": "1",        # publishes to claude.ai; unusable with a gateway key
+    "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1",  # skips the background session-title request
+}
 
 # The guard hook's onFailure: "block" needs this version
 # (code.claude.com/docs/en/hooks: "Requires Claude Code v2.1.295 or later").
@@ -68,6 +85,12 @@ def settings_env(cfg):
         # First interactive start (spec 6.4): skip the onboarding/theme screen.
         "IS_DEMO": "1",
     }
+    env.update(LOAD_REDUCTION_ENV)
+    effort = cfg.effort
+    if effort:
+        # Takes precedence over --effort, /effort and the effortLevel setting
+        # (code.claude.com/docs/en/model-config, "Set the effort level").
+        env["CLAUDE_CODE_EFFORT_LEVEL"] = effort
     env.update(extra)
     for name in CONFLICTING_VARS:
         env[name] = ""

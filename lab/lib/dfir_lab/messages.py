@@ -58,7 +58,8 @@ OUTCOMES = {
         "Copy your key again from the Duke AI dashboard{dashboard} and run: dfir-lab setup-key",
     ),
     "model_forbidden": (
-        "Your key works, but it is not allowed to use the course model {model} (HTTP {status}).",
+        "Your key works, but the gateway says the course model {model} is not available to "
+        "your key, or that no model has that name (HTTP {status}).",
         "This is not something you can fix yourself. {contact_cap} and say that your key "
         "cannot use {model}.",
     ),
@@ -72,9 +73,27 @@ OUTCOMES = {
         "may use.{similar}",
         "{contact_cap} and say that {model} is not available to your key.",
     ),
+    "rate_limit": (
+        "The gateway is holding your key back for a moment (HTTP {status}): it allows each key "
+        "{per_minute}, and you went over that in the last minute.{counted} Every Claude Code "
+        "request counts the whole conversation so far, so a long conversation reaches this "
+        "quickly. This is not your budget and not a problem with your key.",
+        "Wait one minute and try again. Inside Claude Code this is retried by itself; if "
+        "Claude Code stops with 'Request rejected (429)', wait a minute and send your message "
+        "again. Typing /clear to start a fresh conversation makes every request smaller.",
+    ),
+    "budget": (
+        "Your key has used up its budget{budget} (HTTP {status}). The gateway refuses further "
+        "requests until the budget resets.",
+        "Wait until the reset time and try again. Meanwhile you can use the offline replay: "
+        "dfir-lab replay. If you have hardly used the AI, {contact}.",
+    ),
     "limit": (
-        "Your key has reached its usage limit (the daily limit or a rate limit) (HTTP {status}).{retry}",
-        "Wait and try again later. If you have not used the AI much today, {contact}.",
+        "The gateway refused the request because a usage limit of your key was reached "
+        "(HTTP {status}). Your key has per-minute limits{per_minute_paren} and a budget{budget}; "
+        "the gateway did not say which one.{retry}",
+        "Wait one minute and try again. If it still fails, the budget is probably used up "
+        "until it resets; {contact} if you have hardly used the AI.",
     ),
     "busy": (
         "The AI service behind the gateway is busy or temporarily down (HTTP {status}). This is "
@@ -155,6 +174,8 @@ def render(kind, cfg=None, **fields):
     values = {
         "host": "", "port": "", "detail": "", "status": "", "model": "", "body": "",
         "timeout": 8.0, "rtimeout": 60.0, "similar": "", "retry": "",
+        "per_minute": "a limited number of requests and tokens per minute", "counted": "",
+        "budget": "", "per_minute_paren": "",
         "hint": "", "dashboard": "",
         "contact": contact,
         "contact_cap": contact[:1].upper() + contact[1:],
@@ -186,9 +207,28 @@ def render(kind, cfg=None, **fields):
     return redact(what.strip()), redact(todo.strip())
 
 
+def limit_fields(limits):
+    """Template fields that describe the key's real limits (gateway.KeyLimits)."""
+    if limits is None:
+        return {}
+    f = {}
+    pm = limits.per_minute_text()
+    if pm:
+        f["per_minute"] = pm
+        f["per_minute_paren"] = " (%s)" % pm
+    if limits.current_tpm is not None:
+        f["counted"] = " It counted %s tokens for your key in the current minute." % format(
+            limits.current_tpm, ",")
+    bt = limits.budget_text()
+    if bt:
+        f["budget"] = " of " + bt
+    return f
+
+
 def outcome_fields(outcome, net=None):
     f = {"status": outcome.status or "", "detail": outcome.detail, "body": outcome.detail,
          "retry": outcome.retry_after}
+    f.update(limit_fields(getattr(outcome, "limits", None)))
     if net is not None:
         f.update(host=net.host, port=net.port)
     return f
