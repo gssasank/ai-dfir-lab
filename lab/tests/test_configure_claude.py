@@ -310,14 +310,16 @@ class MergeTests(helpers.LabTestCase):
         # key's per-minute limit, so tools the lab never uses are switched off.
         self.apply()
         data = self.load()
-        for tool in ("Workflow", "ScheduleWakeup", "ReportFindings", "ListAgents"):
+        # The sub-agent tool too (approved 2026-11-14): each sub-agent sends its own
+        # full-size requests against the per-minute token limit.
+        for tool in ("Workflow", "ScheduleWakeup", "ReportFindings", "ListAgents", "Agent"):
             self.assertIn(tool, data["permissions"]["deny"])
         for name, value in claude_env.LOAD_REDUCTION_ENV.items():
             self.assertEqual(data["env"][name], value, name)
         env = claude_env.process_env(Config(), base={})
         self.assertEqual(env["CLAUDE_CODE_DISABLE_TERMINAL_TITLE"], "1")
         # Tools students use stay available.
-        for tool in ("Bash", "Read", "Edit", "Write", "Skill", "Agent"):
+        for tool in ("Bash", "Read", "Edit", "Write", "Skill"):
             self.assertNotIn(tool, data["permissions"]["deny"])
 
     def test_trust_case_folder(self):

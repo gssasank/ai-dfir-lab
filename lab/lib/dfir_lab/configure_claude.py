@@ -52,7 +52,10 @@ BUILTIN_FRAGMENT = {
                              "Edit(~/.config/dfir-lab/**)", "WebFetch", "WebSearch",
                              # Tools the lab never uses; a denied tool is left out of every
                              # request (measured 2026-11-14: ~5,900 fewer tokens per request).
-                             "Workflow", "ScheduleWakeup", "ReportFindings", "ListAgents"]},
+                             "Workflow", "ScheduleWakeup", "ReportFindings", "ListAgents",
+                             # Sub-agents send their own full-size requests against the
+                             # per-minute token limit (approved 2026-11-14).
+                             "Agent"]},
     "hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
         {"type": "command", "command": "@LIBEXEC@/pretool-guard", "timeout": 10,
          "onFailure": "block"}]}]},

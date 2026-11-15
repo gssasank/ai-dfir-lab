@@ -48,6 +48,18 @@ DEFAULTS = {
         "worksheet": "",
         "worksheet_template": "",
         "ticket": "ticket.md",
+        # The AI-written report students audit (named in the start banner).
+        "ai_report": "",
+    },
+    # The case's disk image (dfir-lab mount). An empty image means the case has none.
+    "disk": {
+        "image": "",
+        "segments": "",
+        "mount_point": "/mnt/dc01",
+        "ewf_mount": "",
+        "probe": "Windows/System32/config/SYSTEM",
+        "probe_magic": "regf",
+        "zip_name": "",
     },
     "requirements": {
         "min_ram_mb": "5500",

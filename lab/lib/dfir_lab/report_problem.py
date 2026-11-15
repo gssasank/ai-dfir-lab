@@ -3,7 +3,7 @@
 import platform
 import subprocess
 
-from . import check, fsutil, keystore, paths, ui
+from . import check, disk, fsutil, keystore, paths, ui
 from .claude_env import find_claude, process_env
 from .errors import LabError
 from .gateway import Gateway, probe_network
@@ -92,6 +92,12 @@ def run(cfg):
         "== Network ==",
     ]
     sections += _network(cfg)
+    sections += ["", "== Disk image =="]
+    try:
+        ds = disk.settings(cfg)
+        sections += disk.describe(ds, disk.status(ds)) if ds else ["(this case has none)"]
+    except LabError as exc:
+        sections.append("(not readable: %s)" % exc.what)
     sections += ["", "== Latest check results =="]
     if latest.is_file():
         sections += latest.read_text(encoding="utf-8", errors="replace").splitlines()

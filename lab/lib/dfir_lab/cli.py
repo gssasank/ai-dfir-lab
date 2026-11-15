@@ -11,7 +11,9 @@ GLOBAL_FLAGS = ("--debug", "--no-gui", "--pause")
 
 COMMANDS = [
     ("setup-key", "store and test your personal Duke AI key"),
-    ("start", "start Claude Code in the case folder"),
+    ("start", "start Claude Code in the case folder (mounts the disk image first)"),
+    ("mount", "mount the case's disk image read-only (--status: show whether it is)"),
+    ("unmount", "unmount the case's disk image"),
     ("check", "readiness check; prints a readiness code"),
     ("verify-code", "verify a readiness code against its results file"),
     ("checkpoint", "check an investigation checkpoint answer"),
@@ -59,6 +61,14 @@ def build_parser():
                        description="Check the key and gateway, then start Claude Code in the case "
                                    "folder. Arguments after -- go to Claude Code.")
     s.add_argument("claude_args", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
+
+    s = sub.add_parser("mount", parents=[common], help=helps["mount"],
+                       description="Mount the case's disk image read-only and noexec. Safe to "
+                                   "run again; nothing is mounted after the VM restarts.")
+    s.add_argument("--status", action="store_true",
+                   help="only show whether the disk image is mounted (needs no sudo)")
+    sub.add_parser("unmount", parents=[common], help=helps["unmount"],
+                   description="Unmount the case's disk image.")
 
     s = sub.add_parser("check", parents=[common], help=helps["check"],
                        description="Run the readiness checks and print a readiness code.")
@@ -140,6 +150,12 @@ def dispatch(args, passthrough, parser, sub):
         if args.claude_args:
             extra = [a for a in args.claude_args if a != "--"] + extra
         return start.run(cfg, extra)
+    if cmd == "mount":
+        from . import disk
+        return disk.run_mount(cfg, status_only=args.status)
+    if cmd == "unmount":
+        from . import disk
+        return disk.run_unmount(cfg)
     if cmd == "check":
         from . import check
         return check.run(cfg, quick=args.quick, as_json=args.json, only=args.only)

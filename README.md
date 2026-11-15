@@ -10,9 +10,10 @@ Follow this page before class to turn a SANS SIFT Workstation virtual machine (V
 
 ## Before you start
 
-- An Intel or AMD computer. The VM does not run on Apple Silicon Macs or Windows on ARM; if that is your computer, message Sasank at sg765@duke.edu. You can join a team.
+- An Intel or AMD computer. The VM does not run on Apple Silicon Macs or Windows on ARM. If that is your computer, request a virtual machine from Duke OIT at https://vcm.duke.edu and set up there, or pair up with a classmate who can run the VM.
 - About 50 GB of free disk space and at least 8 GB of memory.
 - VMware: Workstation Pro on Windows or Linux, Fusion on an Intel Mac. It is free but needs a Broadcom account to download: https://knowledge.broadcom.com/external/article/368667/
+  VirtualBox is an option but untested.
 - A Duke AI Gateway key: go to https://dashboard.ai.duke.edu, open the AI Gateway tab, click Create Api Key, and leave the fund code blank.
 - The Duke VPN if you are off campus: https://oit.duke.edu/service/vpn/ (server `vpn.duke.edu`, group `-Default-`).
 
@@ -21,10 +22,10 @@ Follow this page before class to turn a SANS SIFT Workstation virtual machine (V
 1. Download the SIFT Workstation OVA from https://www.sans.org/tools/sift-workstation (no SANS account needed). The file is `sift-2026-04-22.ova`, 9.46 GB, SHA-256 `69960210f92f2329ea69c648c971c23d6bd42568de66586ee4b8273797b9c860`.
 2. In VMware, choose File > Open, select the OVA, and keep the defaults.
 3. Start the VM and log in: user `sansforensics`, password `forensics`.
-4. Inside the VM, open Chromium (Firefox does not work in this VM) and go to the course site on Canvas.
-5. From Canvas, download the two lab files into the Downloads folder: the log kit (`szechuan-kit-...zip`, about 8 MB) and the disk image (`DC01-E01.zip`, 4.84 GB).
+4. Inside the VM, open Chromium (Firefox does not work in this VM) and log in to Canvas.
+5. Download the disk image `DC01-E01.zip` (4.84 GB) from https://canvas.duke.edu/courses/82519/files/5803259 into the Downloads folder. This is the only file you download: the setup command fetches everything else.
    Download the disk image inside the VM, not on your own computer: it is evidence from a real intrusion and contains malware.
-6. Open a terminal in the VM and run the setup command below. Wait until it prints `SETUP COMPLETE`.
+6. Open a terminal in the VM and run the setup command below. Wait until it prints `SETUP COMPLETE`. When it asks whether to delete `DC01-E01.zip` to free space, you can answer `y`: the lab uses the unpacked copy.
 7. Double-click "Set up Duke AI access" on the VM desktop and paste your key.
 8. Double-click "Check my setup". When it says `READY`, your setup is done. Do this before class.
 9. On lab day: if you are off campus, connect the Duke VPN on your own computer. Then start the VM and double-click "Start DFIR Lab".
@@ -33,11 +34,11 @@ Follow this page before class to turn a SANS SIFT Workstation virtual machine (V
 
 <!-- BEGIN STUDENT COMMAND -->
 ```
-# The setup command will appear here when the lab is released.
+curl -fsSLO https://raw.githubusercontent.com/gssasank/ai-dfir-lab/v1.0.0/dist/bootstrap.sh && echo "107b630eefd0c298558e46224fc846640103ed7e38d95e6f8af984e6476d8cb8  bootstrap.sh" | sha256sum -c && bash bootstrap.sh
 ```
 <!-- END STUDENT COMMAND -->
 
-The command downloads the setup script, checks its SHA-256, and runs it; it needs internet access, usually takes a few minutes, and is safe to run again.
+The command downloads the setup script, checks its SHA-256, and runs it. The script downloads Claude Code, Protocol SIFT and the log kit itself, and unpacks the disk image from your Downloads folder; it needs internet access, usually takes a few minutes, and is safe to run again.
 If copy and paste from your own computer into the VM does not work, open this page in Chromium inside the VM and copy the command there.
 
 ## If something goes wrong

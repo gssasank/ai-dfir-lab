@@ -42,12 +42,20 @@
   ./Test-Bootstrap.ps1 -Gateway real -KeyFile C:\secure\duke-key.txt
 #>
 param(
-    # bootstrap-<x> for mock runs, gw-<x> for runs against the real gateway.
-    [ValidatePattern('^(bootstrap|gw)-[A-Za-z0-9._-]{1,40}$')]
+    # bootstrap-<x> for mock runs, gw-<x> for runs against the real gateway, rc-<x> for
+    # release-candidate runs (either gateway).
+    [ValidatePattern('^(bootstrap|gw|rc)-[A-Za-z0-9._-]{1,40}$')]
     [string]$RunName = ('bootstrap-' + (Get-Date -Format 'MMdd-HHmmss')),
     [ValidateSet('mock', 'real')][string]$Gateway = 'mock',
     [string]$KeyFile,
-    [string]$KitPath,          # default: build\bootstrap\szechuan-kit-standin.zip
+    # default: the stand-in kit (mock, served by a test build that accepts it) or the
+    # real kit build\casekit\szechuan-kit-0.1.0.zip (real)
+    [string]$KitPath,
+    # The disk image zip, shared read-only into the guest (never copied to the host
+    # elsewhere and never opened on the host). Default: evidence\raw\DC01-E01.zip.
+    [string]$ImagePath,
+    # Seconds the updater watch must cover after the first setup run (at least 600).
+    [int]$UpdaterWatchSec = 660,
     [switch]$KeepVm,
     [switch]$NoBuild,
     [switch]$SkipNegative,
@@ -65,9 +73,18 @@ $CaseId = 'szechuan'
 # Resolve a relative -KitPath / -KeyFile against PowerShell's current location.
 # ([IO.Path]::GetFullPath uses the process directory, which differs: the first
 # real-gateway run failed on that.)
-$KitHost = if ($KitPath) { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($KitPath) } else { Join-Path $Repo 'build\bootstrap\szechuan-kit-standin.zip' }
+$KitHost = if ($KitPath) { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($KitPath) }
+           elseif ($Gateway -eq 'real') { Join-Path $Repo 'kit\szechuan-kit-0.1.0.zip' }
+           else { Join-Path $Repo 'build\bootstrap\szechuan-kit-standin.zip' }
 if ($KeyFile) { $KeyFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($KeyFile) }
 $KitName = [IO.Path]::GetFileName($KitHost)
+$ImageHost = if ($ImagePath) { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ImagePath) } else { Join-Path $Repo 'evidence\raw\DC01-E01.zip' }
+$ImageName = [IO.Path]::GetFileName($ImageHost)
+$ImageShareDir = Split-Path $ImageHost
+$GuestShare = '/mnt/dfir-raw'
+$MockDir = '/var/tmp/dfir-mock'      # survives the reboot test (/tmp is cleared)
+# A test build (accepts the stand-in kit) for mock runs; dist/ for real runs.
+$ServeDir = if ($Gateway -eq 'mock') { Join-Path $Repo 'build\bootstrap\test-dist' } else { Join-Path $Repo 'dist' }
 $VmA = "$RunName-a"
 $VmB = "$RunName-b"
 $Created = [System.Collections.Generic.List[string]]::new()
@@ -209,9 +226,17 @@ function New-Clone([string]$Name) {
     Say "  $Name ready after $($r.ReadySeconds) s"
     $r2 = G $Name "mkdir -p $GuestDir && chmod 755 $GuestDir && echo ok"
     if ($r2.Rc -ne 0) { throw "guest not usable: $($r2.Text)" }
-    foreach ($f in 'start-bootstrap.sh', 'installed-listing.sh', 'first-start-pty.py') {
+    foreach ($f in 'start-bootstrap.sh', 'installed-listing.sh', 'first-start-pty.py', 'pty-run.py', 'watch-updaters.sh') {
         ToGuest $Name (Join-Path $PSScriptRoot "guest\$f") "$GuestDir/$f" -Lf
     }
+    # The disk image reaches the guest through a READ-ONLY shared folder (host side
+    # readonly, guest mount ro); it is never opened on the host.
+    $vmx = Resolve-Vmx $Name
+    $null = Invoke-Vmrun enableSharedFolders $vmx
+    $r = Invoke-Vmrun addSharedFolder $vmx dfirraw $ImageShareDir
+    if ($r.ExitCode -ne 0) { throw "addSharedFolder failed: $($r.Output)" }
+    $null = Invoke-Vmrun setSharedFolderState $vmx dfirraw $ImageShareDir readonly
+    Mount-Share $Name
     if ($Gateway -eq 'mock') {
         # The guest must never contact the real gateway during this test.
         $r3 = G $Name "printf '127.0.0.1 litellm.oit.duke.edu\n::1 litellm.oit.duke.edu\n' >> /etc/hosts && getent hosts litellm.oit.duke.edu" -Sudo
@@ -219,14 +244,36 @@ function New-Clone([string]$Name) {
     }
 }
 
-function Invoke-OneLiner([string]$Vm, [string]$Tag) {
+function Mount-Share([string]$Vm) {
+    $m = G $Vm ("mkdir -p $GuestShare && (mountpoint -q $GuestShare || vmhgfs-fuse .host:/dfirraw $GuestShare -o ro,allow_other) " +
+                "&& test -f '$GuestShare/$ImageName' && findmnt -rn -o OPTIONS --mountpoint $GuestShare") -Sudo
+    if ($m.Rc -ne 0 -or $m.Text -notmatch '(^|,)ro(,|$)') { throw "read-only shared folder not usable in $Vm`: $($m.Text)" }
+    Say "  $Vm`: $GuestShare mounted read-only ($($m.Text))"
+}
+
+function Put-Image([string]$Vm) {
+    # Like the student's browser download: the zip lands in ~/Downloads.
+    Mount-Share $Vm
+    $c = G $Vm "cp '$GuestShare/$ImageName' ~/Downloads/ && stat -c '%s %n' ~/Downloads/$ImageName" -Timeout 1200
+    if ($c.Rc -ne 0) { throw "could not copy the image into $Vm`: $($c.Text)" }
+    Say "  $Vm`: $($c.Text)"
+}
+
+function Invoke-OneLiner([string]$Vm, [string]$Tag, [string]$ExtraArgs = '', [switch]$Pty, $KitUrl = $null) {
     # Runs the student command in the guest and waits for it. Returns a result object.
+    # -ExtraArgs is appended to "bash bootstrap.sh"; -Pty runs it in a pseudo-terminal
+    # that answers [Y/n] questions with y (stdin is /dev/null otherwise).
     $gout = "$GuestDir/$Tag"
     $local = Join-Path $TmpDir "command-$Tag.txt"
-    [IO.File]::WriteAllText($local, $script:StudentCommand + "`n")
+    # The kit download URL is the test-only override DFIR_LAB_KIT_URL (the real
+    # GitHub URL answers 404 while the repository is private).
+    if ($null -eq $KitUrl) { $KitUrl = $script:KitUrl }
+    $cmd = $script:StudentCommand
+    if ($KitUrl) { $cmd = $cmd.Replace('&& bash bootstrap.sh', "&& DFIR_LAB_KIT_URL=$KitUrl bash bootstrap.sh") }
+    [IO.File]::WriteAllText($local, ($cmd + $(if ($ExtraArgs) { " $ExtraArgs" } else { '' })) + "`n")
     $null = G $Vm "mkdir -p $gout"
     ToGuest $Vm $local "$gout/command.txt"
-    $st = G $Vm "bash $GuestDir/start-bootstrap.sh dfir-$Tag $gout"
+    $st = G $Vm "bash $GuestDir/start-bootstrap.sh dfir-$Tag $gout $(if ($Pty) { 'pty' } else { 'plain' })"
     Say "  $($st.Text)"
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $rc = $null
@@ -263,7 +310,7 @@ function Invoke-OneLiner([string]$Vm, [string]$Tag) {
 
 function Collect([string]$Vm) {
     $tgz = "/tmp/dfir-test-collect-$Vm.tgz"
-    $null = G $Vm ("cd / && tar -czf $tgz --ignore-failed-read --exclude=tmp/dfir-test/mock/key " +
+    $null = G $Vm ("cd / && tar -czf $tgz --ignore-failed-read --exclude=var/tmp/dfir-mock/key " +
                    "--exclude=tmp/dfir-test/psift-ref --exclude=tmp/dfir-test/k " +
                    "home/sansforensics/dfir-lab/logs home/sansforensics/dfir-lab/readiness tmp/dfir-test " +
                    "2>/dev/null; ls -l $tgz") -Sudo
@@ -295,7 +342,8 @@ jq -r --arg url "@URL@" '
   "ours_is_demo=\(.env.IS_DEMO == "1")",
   "ours_effort_low=\(.env.CLAUDE_CODE_EFFORT_LEVEL == "low")",
   "ours_model_haiku=\(.env.ANTHROPIC_MODEL == "claude-haiku-5-5" or .env.ANTHROPIC_MODEL == "mock-main")",
-  "ours_deny_unused_tools=\((.permissions.deny // []) | index("Workflow") != null and index("ScheduleWakeup") != null)"' "$f"
+  "ours_deny_unused_tools=\((.permissions.deny // []) | index("Workflow") != null and index("ScheduleWakeup") != null)",
+  "ours_deny_agent=\((.permissions.deny // []) | index("Agent") != null)"' "$f"
 echo "psift_settings_local=$([ -f $HOME/.claude/settings.local.json ] && echo true || echo false)"
 '@ -replace '@URL@', $BaseUrl
     G $Vm $q -Save $Save
@@ -309,34 +357,67 @@ $overall = 'FAIL'
 try {
     Say "Test-Bootstrap $RunName (gateway: $Gateway) - output in $OutDir" 'Cyan'
 
-    Invoke-Step '0' 'Build dist/bootstrap.sh and the stand-in kit' -Critical {
+    Invoke-Step '0' 'Build dist/bootstrap.sh (and, for mock runs, a test build that accepts the stand-in kit)' -Critical {
+        $wslRepo = '/mnt/' + $Repo.Substring(0, 1).ToLower() + ($Repo.Substring(2) -replace '\\', '/')
         if (-not $NoBuild) {
-            $wslRepo = '/mnt/' + $Repo.Substring(0, 1).ToLower() + ($Repo.Substring(2) -replace '\\', '/')
             $b = wsl.exe -d Ubuntu -- bash -c "cd '$wslRepo' && python3 bootstrap/build.py standin-kit && python3 bootstrap/build.py --check" 2>&1 | Out-String
             Say ($b.TrimEnd() -replace '(?m)^', '  ')
             Check ($LASTEXITCODE -eq 0) 'build.py standin-kit and build.py --check succeeded'
             Check ($b -match 'Deterministic: yes') 'two builds give the same SHA-256'
+            Check ($b -match '1 accepted kit hash') 'dist/bootstrap.sh accepts only the real kit'
+            if ($Gateway -eq 'mock') {
+                $standin = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $Repo 'build\bootstrap\szechuan-kit-standin.zip')).Hash.ToLower()
+                $t = wsl.exe -d Ubuntu -- bash -c "cd '$wslRepo' && python3 bootstrap/build.py --test-kit-sha256 $standin --out build/bootstrap/test-dist" 2>&1 | Out-String
+                Say ($t.TrimEnd() -replace '(?m)^', '  ')
+                Check ($LASTEXITCODE -eq 0 -and $t -match 'TEST BUILD') 'test build for the stand-in kit (build/bootstrap/test-dist, not dist/)'
+            }
         }
-        $script:Sha = ((Get-Content -LiteralPath (Join-Path $Repo 'dist\bootstrap.sh.sha256') -Raw) -split '\s+')[0]
-        $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $Repo 'dist\bootstrap.sh')).Hash.ToLower()
-        Check ($actual -eq $script:Sha) "dist/bootstrap.sh matches dist/bootstrap.sh.sha256 ($actual)"
+        $script:Sha = ((Get-Content -LiteralPath (Join-Path $ServeDir 'bootstrap.sh.sha256') -Raw) -split '\s+')[0]
+        $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $ServeDir 'bootstrap.sh')).Hash.ToLower()
+        Check ($actual -eq $script:Sha) "served bootstrap.sh matches its .sha256 ($actual, from $ServeDir)"
         Check (Test-Path -LiteralPath $KitHost) "case kit exists ($KitHost)"
-        $script:Server = Start-FileServer $HostAddress $Port @{ '/dist/bootstrap.sh' = (Join-Path $Repo 'dist\bootstrap.sh') }
+        Check ((Get-Item -LiteralPath $ImageHost).Length -eq 4836649413) "disk image zip exists with the expected size ($ImageHost)"
+        # The kit is served next to the script, as GitHub will serve it from the release;
+        # /kit/not-the-kit.zip is a file with the wrong SHA-256, for the mismatch test.
+        $script:Server = Start-FileServer $HostAddress $Port @{ '/dist/bootstrap.sh' = (Join-Path $ServeDir 'bootstrap.sh')
+                                                               "/kit/$KitName" = $KitHost
+                                                               '/kit/not-the-kit.zip' = (Join-Path $ServeDir 'bootstrap.sh.sha256') }
+        $script:KitUrl = "http://$HostAddress`:$Port/kit/$KitName"
+        Say "  serving the kit at $($script:KitUrl) (DFIR_LAB_KIT_URL)"
         $script:StudentCommand = "curl -fsSLO http://$HostAddress`:$Port/dist/bootstrap.sh && echo `"$($script:Sha)  bootstrap.sh`" | sha256sum -c && bash bootstrap.sh"
         Say "  serving dist/bootstrap.sh on http://$HostAddress`:$Port"
         Say "  student command used: $($script:StudentCommand)"
     }
 
-    Invoke-Step '1' 'Fresh clone, kit in ~/Downloads, run the one-line command as the student' -Critical {
+    Invoke-Step '1' 'Fresh clone, disk image in ~/Downloads (the setup downloads the kit), run the one-line command as the student' -Critical {
         New-Clone $VmA
-        ToGuest $VmA $KitHost "/home/sansforensics/Downloads/$KitName"
+        Put-Image $VmA
         $script:Run1 = Invoke-OneLiner $VmA 'run1'
+        # Watch the desktop for updater windows from now on (evaluated in step U).
+        $script:WatchStart = Get-Date
+        $w = G $VmA ("export XDG_RUNTIME_DIR=/run/user/`$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/`$(id -u)/bus; " +
+                     "mkdir -p /var/tmp/dfir-watch && systemd-run --user --collect --quiet --unit=dfir-watch-updaters " +
+                     "bash $GuestDir/watch-updaters.sh $UpdaterWatchSec /var/tmp/dfir-watch/updaters.log && echo started")
+        Say "  updater watch ($UpdaterWatchSec s): $($w.Text)"
     }
 
     Invoke-Step '2' 'Exit code 0, SETUP COMPLETE, log collected' -Critical {
         Check ($script:Run1.Rc -eq 0) "exit code is 0 (got $($script:Run1.Rc))"
         Check ($script:Run1.Screen -match 'SETUP COMPLETE') 'screen says SETUP COMPLETE'
         Check ($script:Run1.Screen -match 'bootstrap\.sh: OK') 'sha256sum -c accepted the download'
+        Check ($script:Run1.Screen -match 'turned off the Software Updater pop-ups and the new-release prompt') 'updater pop-ups turned off'
+        Check ($script:Run1.Screen -match 'downloading the case kit \(szechuan-kit-0\.1\.0\.zip' -and $script:Run1.Screen -match 'ok: downloaded the case kit and verified its SHA-256') 'no kit on the VM: the setup downloaded it and verified its SHA-256'
+        Check (@($script:Server.State.Log | Where-Object { $_ -match "GET /kit/$([regex]::Escape($KitName)) .*200 OK" }).Count -ge 1) 'the kit was fetched from the URL next to the script'
+        Check ($script:Run1.Screen -match 'holds live malware.*keep it inside this VM') 'one line says why the image stays in the VM'
+        Check ($script:Run1.Screen -match "checking /home/sansforensics/Downloads/$([regex]::Escape($ImageName))") 'the image zip was found in ~/Downloads and its SHA-256 checked'
+        Check ($script:Run1.Screen -match 'disk image installed in /cases/szechuan/disk') 'the image was unpacked under /cases/szechuan/disk'
+        Check ($script:Run1.Screen -match 'kept /home/sansforensics/Downloads/DC01-E01\.zip') 'without a terminal to ask, the zip is kept and the student is told'
+        Check ($script:Run1.Screen -match 'passed: Case files: .*disk image: 3 files match their SHA-256, mounted read-only and noexec at /mnt/dc01') 'check 3 verified, mounted and read the image'
+        Check ($script:Run1.Screen -match 'Disk image\s+DC01\.E01') 'summary lists the disk image'
+        $rp = G $VmA 'dfir-lab replay --list --no-gui; echo "rc=$?"; ls /cases/szechuan/ticket.md /cases/szechuan/ai-report.md /cases/szechuan/CLAUDE.md'
+        Say ($rp.Text -replace '(?m)^', '    ')
+        Check ($rp.Text -match 'szechuan-cp3-cp6' -and $rp.Text -match 'rc=0') 'the offline replay lists the recorded session'
+        Check ($rp.Text -match 'ai-report\.md' -and $rp.Text -notmatch 'No such file') 'ticket, AI report and case CLAUDE.md are installed'
         $logs = G $VmA 'ls -1 ~/dfir-lab/logs/bootstrap-*.log'
         Check ($logs.Rc -eq 0 -and $logs.Text) "log written: $($logs.Text)"
         $script:Run1Log = ($logs.Text -split "`n")[0].Trim()
@@ -370,6 +451,73 @@ stat -c '%U:%G %a %n' $c $c/evidence "$ev" $c/CLAUDE.md $c/analysis $c/MANIFEST.
         Check ($t.Text -match 'student can write analysis: yes') 'analysis/ is writable by the student'
     }
 
+    Invoke-Step '2d' 'Disk image: root-owned read-only files, DC01.E01 works with every tool, mount is ro+noexec' {
+        # Nothing from the image is ever executed: the checks read the mount table,
+        # file modes and file contents only.
+        $d = G $VmA @'
+set -u
+D=/cases/szechuan/disk; I=$D/DC01.E01; T=/tmp/dfir-test
+stat -c 'mode %U %a %n' $D $D/20200918_0347_CDrive.E01 $D/20200918_0347_CDrive.E02 $D/20200918_0347_CDrive.E01.txt
+echo "links: $(readlink $D/DC01.E01) $(readlink $D/DC01.E02)"
+echo "student-can-write-segment: $([ -w $D/20200918_0347_CDrive.E01 ] && echo yes || echo no) folder: $([ -w $D ] && echo yes || echo no)"
+ewfinfo $I > $T/ewfinfo.txt 2>&1; echo "ewfinfo=$? $(grep -m1 'Media size' $T/ewfinfo.txt | tr -s '\t ' ' ')"
+mmls $I > $T/mmls.txt 2>&1; echo "mmls=$? ntfs=$(grep -c NTFS $T/mmls.txt)"
+for s in $(awk '$1 ~ /^[0-9]+:$/ && /NTFS/ {print $3+0}' $T/mmls.txt); do
+  n=$(ifind -o $s -n /Windows/System32/config/SYSTEM $I 2>/dev/null)
+  if [[ $n =~ ^[0-9]+$ ]]; then
+    echo "ifind=ok"
+    fls -o $s $I | grep -q $'\tWindows$' && echo "fls=ok"
+    [ "$(icat -o $s $I $n 2>/dev/null | head -c 4)" = regf ] && echo "icat=ok"
+  fi
+done
+mkdir -p $T/ewft; ewfmount $I $T/ewft > /dev/null 2>&1; echo "ewfmount=$? size=$(stat -c %s $T/ewft/ewf1 2>/dev/null)"
+for i in 1 2 3 4 5; do fusermount -u $T/ewft 2>/dev/null && break; sleep 1; done
+echo "ewfverify: $(ewfverify -q $I 2>&1 | tail -n 1)"
+echo "table: $(findmnt -rn -o SOURCE,FSTYPE,VFS-OPTIONS --mountpoint /mnt/dc01)"
+src=$(findmnt -rn -o SOURCE --mountpoint /mnt/dc01); echo "loop: $(losetup -nO RO,BACK-FILE $src | tr -s ' ')"
+dfir-lab mount --status; echo "status-rc=$?"
+echo "read-as-student: $(head -c 4 /mnt/dc01/Windows/System32/config/SYSTEM)"
+'@ -Timeout 900 -Save "$VmA\disk-image.txt"
+        Say ($d.Text -replace '(?m)^', '    ')
+        Check ($d.Text -match 'mode root 755 /cases/szechuan/disk' -and ([regex]::Matches($d.Text, 'mode root 444 ')).Count -eq 3) 'segments root-owned, mode 444, in a root-owned folder'
+        Check ($d.Text -match 'links: 20200918_0347_CDrive\.E01 20200918_0347_CDrive\.E02') 'short names DC01.E01 and DC01.E02 point at the segments'
+        Check ($d.Text -match 'student-can-write-segment: no folder: no') 'the student cannot change the image'
+        Check ($d.Text -match 'ewfinfo=0\s+Media size: 11 GiB \(12079595520 bytes\)') 'ewfinfo accepts DC01.E01 (both segments read)'
+        Check ($d.Text -match 'mmls=0 ntfs=2') 'mmls accepts DC01.E01'
+        Check ($d.Text -match 'ifind=ok' -and $d.Text -match 'fls=ok' -and $d.Text -match 'icat=ok') 'fls, ifind and icat accept DC01.E01'
+        Check ($d.Text -match 'ewfmount=0 size=12079595520') 'ewfmount accepts DC01.E01'
+        Check ($d.Text -match 'ewfverify: ewfverify: SUCCESS') 'ewfverify accepts DC01.E01 and verifies the image'
+        Check ($d.Text -match 'table: /dev/loop\d+ fuseblk \S*\bro\b' -and $d.Text -match 'table: .*noexec' -and $d.Text -match 'table: .*nodev' -and $d.Text -match 'table: .*nosuid') 'mount table: /mnt/dc01 is ro,noexec,nodev,nosuid'
+        Check ($d.Text -match 'loop:\s+1 /mnt/ewf_dc01/ewf1') 'the loop device is read-only over the ewfmount file'
+        Check ($d.Text -match 'status-rc=0' -and $d.Text -match 'read-only and noexec at /mnt/dc01') 'dfir-lab mount --status (no sudo) says mounted'
+        Check ($d.Text -match 'read-as-student: regf') 'the student reads files on the mount without sudo'
+    }
+
+    Invoke-Step '2e' 'Mount commands: idempotent, no stacking, unmount twice, mount again' {
+        $m = G $VmA @'
+dfir-lab mount; echo "m1=$?"
+dfir-lab unmount; echo "u1=$?"
+dfir-lab unmount; echo "u2=$?"
+dfir-lab mount --status > /dev/null; echo "s1=$?"
+echo "loops-left=$(losetup -nO BACK-FILE | grep -c ewf_dc01)"
+sudo mount -t tmpfs -o size=1m dfir-test-tmpfs /mnt/dc01
+dfir-lab mount; echo "stacked=$?"
+echo "mounts-on-dc01=$(findmnt -rn --mountpoint /mnt/dc01 | wc -l) $(findmnt -rn -o FSTYPE --mountpoint /mnt/dc01)"
+sudo umount /mnt/dc01
+dfir-lab mount; echo "m2=$?"
+dfir-lab mount; echo "m3=$?"
+echo "mounts-on-dc01=$(findmnt -rn --mountpoint /mnt/dc01 | wc -l) $(findmnt -rn -o FSTYPE --mountpoint /mnt/dc01)"
+'@ -Timeout 300 -Save "$VmA\mount-commands.txt"
+        Say ($m.Text -replace '(?m)^', '    ')
+        Check ($m.Text -match 'already mounted read-only' -and $m.Text -match 'm1=0') 'mount on a mounted image: "already mounted", exit 0'
+        Check ($m.Text -match 'The disk image is unmounted' -and $m.Text -match 'u1=0') 'unmount works'
+        Check ($m.Text -match 'Nothing was mounted' -and $m.Text -match 'u2=0') 'second unmount is harmless'
+        Check ($m.Text -match 's1=1' -and $m.Text -match 'loops-left=0') 'nothing left mounted or attached'
+        Check ($m.Text -match 'already used by another mount' -and $m.Text -match 'stacked=1' -and $m.Text -match 'mounts-on-dc01=1 tmpfs') 'refuses to stack the image on a busy mount point'
+        Check ($m.Text -match 'm2=0' -and $m.Text -match 'm3=0' -and $m.Text -match 'mounts-on-dc01=1 fuseblk') 'mounts again; a second mount leaves exactly one'
+        Check ($m.Text -notmatch '(?i)offset|sector') 'messages never mention the partition offset'
+    }
+
     Invoke-Step '6' 'Second run changes nothing (run right after the first)' {
         # Wait first: in an earlier version the desktop's metadata daemon dropped the
         # shortcuts' trusted flag about a minute after the first run.
@@ -381,6 +529,8 @@ stat -c '%U:%G %a %n' $c $c/evidence "$ev" $c/CLAUDE.md $c/analysis $c/MANIFEST.
         Check ($script:Run2.Rc -eq 0) "second run exit code 0 (got $($script:Run2.Rc))"
         Check ($script:Run2.Screen -match 'This run changed nothing') 'second run says it changed nothing'
         Check ($script:Run2.Screen -notmatch '      ok: ') 'second run reports no step as newly done'
+        Check ($script:Run2.Screen -match 'already done: the disk image is in /cases/szechuan/disk \(3 files verified, read-only\)') 'second run verified the disk image and skipped it'
+        Check ($script:Run2.Screen -match 'already done: the Software Updater pop-ups and the new-release prompt are off') 'second run: updater settings already in place'
         $diff = Compare-Object ($before.Text -split "`n") ($after.Text -split "`n")
         if ($diff) { Say (($diff | Out-String).TrimEnd() -replace '(?m)^', '    ') 'Yellow' }
         Check (-not $diff) "installed files, settings and desktop settings identical ($lines listing lines)"
@@ -390,19 +540,20 @@ stat -c '%U:%G %a %n' $c $c/evidence "$ev" $c/CLAUDE.md $c/analysis $c/MANIFEST.
 
     Invoke-Step '3' "Key stored, dfir-lab check --json: all eleven checks pass ($Gateway gateway)" -Critical {
         if ($Gateway -eq 'mock') {
-            ToGuest $VmA (Join-Path $Repo 'tools\mock-gateway\mock_gateway.py') "$GuestDir/mock_gateway.py" -Lf
-            ToGuest $VmA (Join-Path $Repo 'tools\mock-gateway\scenarios\readiness.json') "$GuestDir/readiness.json" -Lf
-            ToGuest $VmA (Join-Path $Repo 'lab\tests\fixtures\guard-probe.json') "$GuestDir/guard-probe.json" -Lf
+            $null = G $VmA "mkdir -p $MockDir"
+            ToGuest $VmA (Join-Path $Repo 'tools\mock-gateway\mock_gateway.py') "$MockDir/mock_gateway.py" -Lf
+            ToGuest $VmA (Join-Path $Repo 'tools\mock-gateway\scenarios\readiness.json') "$MockDir/readiness.json" -Lf
+            ToGuest $VmA (Join-Path $Repo 'lab\tests\fixtures\guard-probe.json') "$MockDir/guard-probe.json" -Lf
             $m = G $VmA @'
 set -u
-mkdir -p /tmp/dfir-test/mock && cd /tmp/dfir-test/mock
+mkdir -p /var/tmp/dfir-mock && cd /var/tmp/dfir-mock
 umask 077
 printf 'sk-mock-%s\n' "$(head -c 18 /dev/urandom | od -An -tx1 | tr -d ' \n')" > key
 umask 022
 export XDG_RUNTIME_DIR=/run/user/$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus
-systemd-run --user --collect --quiet --unit=dfir-mock python3 /tmp/dfir-test/mock_gateway.py --port 8765 \
-  --key-file /tmp/dfir-test/mock/key --scenario /tmp/dfir-test/readiness.json \
-  --scenario /tmp/dfir-test/guard-probe.json --log /tmp/dfir-test/mock/mock.log
+systemd-run --user --collect --quiet --unit=dfir-mock python3 /var/tmp/dfir-mock/mock_gateway.py --port 8765 \
+  --key-file /var/tmp/dfir-mock/key --scenario /var/tmp/dfir-mock/readiness.json \
+  --scenario /var/tmp/dfir-mock/guard-probe.json --log /var/tmp/dfir-mock/mock.log
 for i in $(seq 30); do curl -sf -o /dev/null http://127.0.0.1:8765/_mock/state && break; sleep 1; done
 curl -s http://127.0.0.1:8765/_mock/state; echo
 sudo sed -i -e 's#^base_url = .*#base_url = http://127.0.0.1:8765#' -e 's#^model_main = .*#model_main = mock-main#' \
@@ -469,14 +620,21 @@ done
         $s = Jq-Settings $VmA $script:BaseUrl "$VmA\settings-merged.txt"
         Say ($s.Text -replace '(?m)^', '    ')
         Check ($s.Text -notmatch '=false') "merged settings contain Protocol SIFT's entries and ours"
+        # The tools Claude Code offers the model in the lab's session (its init event).
+        $tl = G $VmA @'
+cd /cases/szechuan && ~/.local/bin/claude -p "Reply with the single word OK." --max-turns 1 --output-format stream-json \
+  --verbose --no-session-persistence < /dev/null 2>/dev/null | jq -c 'select(.type == "system" and .subtype == "init") | {tools}' | head -n 1
+'@ -Timeout 300 -Save "$VmA\session-tools.txt"
+        Say "    session tools: $($tl.Text)"
+        Check ($tl.Text -match '"Bash"' -and $tl.Text -notmatch '"Agent"' -and $tl.Text -notmatch '"Task"') 'the sub-agent tool (Agent) is not offered in the lab session; Bash is'
         if ($Gateway -eq 'mock') {
             $gp = G $VmA @'
 mkdir -p /tmp/dfir-test/probe && cd /tmp/dfir-test/probe
-before=$(wc -l < /tmp/dfir-test/mock/mock.log)
+before=$(wc -l < /var/tmp/dfir-mock/mock.log)
 ~/.local/bin/claude -p "GUARD-PROBE: do what the scenario says." --max-turns 4 --output-format json \
   --permission-mode dontAsk --allowedTools Bash --no-session-persistence > probe-out.json 2>&1 < /dev/null
 echo "claude exit=$?"
-tail -n +$((before + 1)) /tmp/dfir-test/mock/mock.log | jq -s -c '[.[] | select(.tool_result_seen == true)] |
+tail -n +$((before + 1)) /var/tmp/dfir-mock/mock.log | jq -s -c '[.[] | select(.tool_result_seen == true)] |
   {followups: length, blocked: any(.[]; .tool_result_blocked_by_guard), leaked: any(.[]; .tool_result_contains_key)}'
 grep -o 'Blocked by the DFIR lab[^"]*' probe-out.json | head -n 2
 '@ -Timeout 400 -Save "$VmA\guard-probe.txt"
@@ -563,21 +721,47 @@ pgrep -af gnome-terminal | head -n 3
     }
 
     if (-not $SkipNegative) {
-        Invoke-Step '8' 'Second clone without a kit: INCOMPLETE, then complete after adding the kit' {
+        Invoke-Step '8' 'Second clone: kit download fails (404, then wrong SHA-256) and no image: INCOMPLETE; kit in ~/Downloads: INCOMPLETE (image); image: complete' {
             New-Clone $VmB
-            $n1 = Invoke-OneLiner $VmB 'nokit'
+            $missing = "http://$HostAddress`:$Port/kit/missing.zip"
+            $n1 = Invoke-OneLiner $VmB 'nokit' -KitUrl $missing
             Check ($n1.Rc -ne 0) "exit code is non-zero (got $($n1.Rc))"
             Check ($n1.Screen -match 'SETUP INCOMPLETE') 'screen says SETUP INCOMPLETE'
-            Check ($n1.Screen -match 'download the case kit \(szechuan-kit-\*\.zip\)' -and $n1.Screen -match '~/Downloads') 'it tells the student to download the kit (into ~/Downloads) and run again'
+            Check ($n1.Screen -match 'the case kit could not be downloaded \(the server answered HTTP 404\)' -and $n1.Screen -match 'run the same setup command again') 'a failed kit download is reported plainly, with "run the setup command again"'
+            Check ($n1.Screen -match 'the disk image is not on this VM yet' -and $n1.Screen -match 'download the disk image \(DC01-E01\.zip, 4\.5 GB\)') 'it tells the student to download the disk image and run again'
             Check ($n1.Screen -match 'Claude Code\s+2\.1\.322') 'everything else was still installed'
-            Check (([regex]::Matches($n1.Screen, '(?m)^   - ')).Count -eq 1) 'the kit is the only unfinished item listed'
+            Check (([regex]::Matches($n1.Screen, '(?m)^   - ')).Count -eq 2) 'the kit and the image are the only unfinished items'
+            $n1b = Invoke-OneLiner $VmB 'badkit' -KitUrl "http://$HostAddress`:$Port/kit/not-the-kit.zip"
+            Check ($n1b.Rc -ne 0 -and $n1b.Screen -match 'the downloaded case kit does not match its expected SHA-256, so it was not installed') 'a download with the wrong SHA-256 is refused and reported'
+            $nk = G $VmB 'test -e /cases/szechuan/evidence && echo evidence-present || echo evidence-absent'
+            Check ($nk.Text -match 'evidence-absent') 'nothing from the unverified download was installed'
+            # Offline fallback: an accepted kit already in ~/Downloads is used without downloading.
             ToGuest $VmB $KitHost "/home/sansforensics/Downloads/$KitName"
-            $n2 = Invoke-OneLiner $VmB 'withkit'
-            Check ($n2.Rc -eq 0) "rerun after adding the kit: exit code 0 (got $($n2.Rc))"
-            Check ($n2.Screen -match 'SETUP COMPLETE') 'rerun says SETUP COMPLETE'
-            Check ($n2.Screen -match 'already done: Claude Code') 'rerun skipped what was already done'
+            $n2 = Invoke-OneLiner $VmB 'kitonly' -KitUrl $missing
+            Check ($n2.Screen -match "checking /home/sansforensics/Downloads/$([regex]::Escape($KitName))" -and $n2.Screen -notmatch 'downloading the case kit' -and $n2.Screen -match 'ok: case szechuan installed') 'a kit found in ~/Downloads is used and nothing is downloaded'
+            Check ($n2.Rc -ne 0 -and $n2.Screen -match 'SETUP INCOMPLETE') "kit added, image still missing: INCOMPLETE (exit $($n2.Rc))"
+            Check (([regex]::Matches($n2.Screen, '(?m)^   - ')).Count -eq 1 -and $n2.Screen -match '   - the disk image is not on this VM yet') 'the missing image is the only unfinished item'
+            Check ($n2.Screen -match 'waiting: Case files \(needs the case files and the disk image\)') 'check 3 waits for the image instead of adding a second item'
+            # The student downloads the image and runs the command again in a terminal,
+            # answering the question about deleting the zip with y.
+            Put-Image $VmB
+            $n3 = Invoke-OneLiner $VmB 'withimage' -Pty
+            Check ($n3.Rc -eq 0 -and $n3.Screen -match 'SETUP COMPLETE') "rerun after adding the image: SETUP COMPLETE (exit $($n3.Rc))"
+            Check ($n3.Screen -match 'already done: Claude Code' -and $n3.Screen -match 'already done: case szechuan is installed') 'rerun skipped what was already done'
+            Check ($n3.Screen -match 'Delete /home/sansforensics/Downloads/DC01-E01\.zip to free 4\.5 GB\? \[Y/n\]' -and $n3.Screen -match 'deleted /home/sansforensics/Downloads/DC01-E01\.zip') 'it offered to delete the zip and deleted it on y'
+            $z = G $VmB 'test -e ~/Downloads/DC01-E01.zip && echo zip-present || echo zip-absent; dfir-lab mount --status | tail -n 1'
+            Check ($z.Text -match 'zip-absent' -and $z.Text -match 'read-only and noexec at /mnt/dc01') "zip gone, image mounted ($($z.Text -replace "`n", '; '))"
+            # --image with a path outside the home folder: installs again, offers no deletion.
+            $null = G $VmB 'dfir-lab unmount && sudo rm -rf /cases/szechuan/disk'
+            Mount-Share $VmB
+            $n4 = Invoke-OneLiner $VmB 'imagearg' -ExtraArgs "--image $GuestShare/$ImageName"
+            Check ($n4.Rc -eq 0 -and $n4.Screen -match 'SETUP COMPLETE') "--image $GuestShare/$ImageName`: SETUP COMPLETE (exit $($n4.Rc))"
+            Check ($n4.Screen -match "checking $GuestShare/$ImageName" -and $n4.Screen -match 'disk image installed in /cases/szechuan/disk') '--image was used and the image installed again'
+            Check ($n4.Screen -notmatch 'Delete .*DC01-E01\.zip' -and $n4.Screen -notmatch 'kept .*DC01-E01\.zip') 'no deletion offer for a zip outside the home folder'
             $script:Metrics['nokit_seconds'] = $n1.Seconds
-            $script:Metrics['withkit_rerun_seconds'] = $n2.Seconds
+            $script:Metrics['kitonly_rerun_seconds'] = $n2.Seconds
+            $script:Metrics['withimage_rerun_seconds'] = $n3.Seconds
+            $script:Metrics['imagearg_rerun_seconds'] = $n4.Seconds
         }
 
         Invoke-Step '8b' 'Uninstall (keeps Claude Code, Protocol SIFT and work), then purge' {
@@ -586,9 +770,10 @@ pgrep -af gnome-terminal | head -n 3
 echo notes > /cases/szechuan/analysis/my-notes.txt
 bash ~/bootstrap.sh --uninstall --yes > /tmp/dfir-test/uninstall.txt 2>&1; echo "uninstall exit=$?"
 cat /tmp/dfir-test/uninstall.txt
-for p in /usr/local/bin/dfir-lab /etc/dfir-lab /cases/szechuan/evidence /cases/szechuan/analysis/my-notes.txt ~/.local/bin/claude ~/.claude/CLAUDE.md ~/Desktop/dfir-lab-start.desktop; do
+for p in /usr/local/bin/dfir-lab /etc/dfir-lab /cases/szechuan/evidence /cases/szechuan/disk /cases/szechuan/analysis/my-notes.txt ~/.local/bin/claude ~/.claude/CLAUDE.md ~/Desktop/dfir-lab-start.desktop ~/.config/autostart/update-notifier.desktop /mnt/dc01; do
   [ -e "$p" ] && echo "present $p" || echo "absent $p"
 done
+echo "mounts-left=$(findmnt -rn | grep -c -E '/mnt/(dc01|ewf_dc01)')"
 grep -c 'dfir-lab setup' ~/.bashrc
 bash ~/bootstrap.sh --uninstall --purge --yes > /tmp/dfir-test/purge.txt 2>&1; echo "purge exit=$?"
 for p in /cases/szechuan ~/.local/bin/claude ~/.claude ~/dfir-lab; do [ -e "$p" ] && echo "after purge present $p" || echo "after purge absent $p"; done
@@ -596,11 +781,60 @@ for p in /cases/szechuan ~/.local/bin/claude ~/.claude ~/dfir-lab; do [ -e "$p" 
             Say ($u.Text -replace '(?m)^', '    ')
             Check ($u.Text -match 'uninstall exit=0') 'uninstall exit 0'
             Check ($u.Text -match 'absent /usr/local/bin/dfir-lab' -and $u.Text -match 'absent /etc/dfir-lab' -and $u.Text -match 'absent /cases/szechuan/evidence') 'toolkit and case files removed'
+            Check ($u.Text -match 'unmounted the disk image from /mnt/dc01' -and $u.Text -match 'mounts-left=0' -and $u.Text -match 'absent /cases/szechuan/disk' -and $u.Text -match 'absent /mnt/dc01') 'disk image unmounted and removed'
+            Check ($u.Text -match 'absent /home/sansforensics/.config/autostart/update-notifier.desktop') 'updater autostart override removed'
             Check ($u.Text -match 'present /cases/szechuan/analysis/my-notes.txt') "student's work kept"
             Check ($u.Text -match 'present /home/sansforensics/.local/bin/claude' -and $u.Text -match 'present /home/sansforensics/.claude/CLAUDE.md') 'Claude Code and Protocol SIFT kept'
             Check ($u.Text -match '(?m)^0$') '.bashrc block removed'
             Check ($u.Text -match 'purge exit=0' -and $u.Text -notmatch 'after purge present') 'purge removed the rest'
         }
+    }
+
+    Invoke-Step 'U' "No updater window for $UpdaterWatchSec s after the setup; release-upgrade prompt off" {
+        $left = $UpdaterWatchSec + 20 - ((Get-Date) - $script:WatchStart).TotalSeconds
+        if ($left -gt 0) { Say "    waiting $([int]$left) s more for the watch to finish"; Start-Sleep -Seconds ([int]$left) }
+        $w = G $VmA @'
+cat /var/tmp/dfir-watch/updaters.log
+echo "prompt: $(grep '^Prompt=' /etc/update-manager/release-upgrades)"
+echo "autostart: $(grep -c '^Hidden=true' ~/.config/autostart/update-notifier.desktop 2>/dev/null)"
+echo "notifier-running: $(pgrep -c -x update-notifier)"
+'@ -Save "$VmA\updater-watch.txt"
+        $lines = @($w.Text -split "`n" | Where-Object { $_ -match '^\d\d:\d\d:\d\d procs=' })
+        Say "    $($lines.Count) samples; first: $($lines[0]); last: $($lines[-1])"
+        $bad = @($lines | Where-Object { $_ -match 'update-manager|check-new-release|do-release-upgrade' -or $_ -notmatch 'windows=\[\]' })
+        foreach ($b in $bad) { Say "    $b" 'Yellow' }
+        Check ($w.Text -match '(?m)END$' -and $lines.Count -ge [int]($UpdaterWatchSec / 10) - 3) "the watch covered $UpdaterWatchSec s ($($lines.Count) samples)"
+        Check ($bad.Count -eq 0) 'no Software Updater, release-upgrade or other updater window or process appeared'
+        Check ($w.Text -match 'prompt: Prompt=never') 'release-upgrade prompt is off (Prompt=never)'
+        Check ($w.Text -match 'autostart: 1' -and $w.Text -match 'notifier-running: 0') 'update-notifier is stopped and will not start at login'
+    }
+
+    Invoke-Step 'R' 'Reboot: nothing is mounted; dfir-lab start mounts the image again' {
+        $vmx = Resolve-Vmx $VmA
+        $null = G $VmA 'sudo systemctl reboot' -Timeout 30
+        Start-Sleep -Seconds 25
+        $ready = Wait-GuestReady -Vmx $vmx -TimeoutSec 600
+        Check $ready.Ready "guest back after the reboot ($($ready.Seconds) s)"
+        Start-Sleep -Seconds 60     # let the desktop session (autostart) settle
+        if ($Gateway -eq 'mock') {
+            $null = G $VmA ("export XDG_RUNTIME_DIR=/run/user/`$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/`$(id -u)/bus; " +
+                "systemd-run --user --collect --quiet --unit=dfir-mock2 python3 $MockDir/mock_gateway.py --port 8765 " +
+                "--key-file $MockDir/key --scenario $MockDir/readiness.json --log $MockDir/mock2.log; " +
+                "for i in `$(seq 30); do curl -sf -o /dev/null http://127.0.0.1:8765/_mock/state && break; sleep 1; done")
+        }
+        $r = G $VmA @'
+dfir-lab mount --status; echo "status-before=$?"
+echo "notifier-after-reboot: $(pgrep -c -x update-notifier)"
+DFIR_LAB_NO_EXEC=1 dfir-lab start --no-gui < /dev/null 2>&1; echo "start=$?"
+dfir-lab mount --status; echo "status-after=$?"
+echo "table: $(findmnt -rn -o FSTYPE,VFS-OPTIONS --mountpoint /mnt/dc01)"
+'@ -Timeout 300 -Save "$VmA\reboot.txt"
+        Say ($r.Text -replace '(?m)^', '    ')
+        Check ($r.Text -match 'Mounted    : no' -and $r.Text -match 'status-before=1') 'after the reboot nothing is mounted'
+        Check ($r.Text -match 'notifier-after-reboot: 0') 'update-notifier did not start at login after the reboot'
+        Check ($r.Text -match 'Mounting the disk image read-only at /mnt/dc01' -and $r.Text -match 'Disk image: mounted read-only at /mnt/dc01' -and $r.Text -match 'start=0') 'dfir-lab start mounted the image before starting Claude Code'
+        Check ($r.Text -match 'Incident ticket: /cases/szechuan/ticket\.md' -and $r.Text -match 'AI report to check \(worksheet Section C\): /cases/szechuan/ai-report\.md' -and $r.Text -match '/clear') 'start shows the ticket, the AI report and the /clear reminder'
+        Check ($r.Text -match 'status-after=0' -and $r.Text -match 'table: fuseblk \S*noexec') 'mounted read-only and noexec again'
     }
     $overall = if (@($Results | Where-Object Status -ne 'PASS').Count -eq 0) { 'PASS' } else { 'FAIL' }
 }

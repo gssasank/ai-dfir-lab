@@ -1,0 +1,155 @@
+#!/bin/bash
+# Root helper for `dfir-lab mount` and `dfir-lab unmount` (run through sudo).
+#
+#   disk-mount mount   IMAGE EWF_MOUNT MOUNT_POINT
+#   disk-mount unmount IMAGE EWF_MOUNT MOUNT_POINT
+#
+# Layers (adapted from the tested casekit/disk/mount-case.sh):
+#   IMAGE (first E01 segment; the next segments sit beside it)
+#   -> ewfmount -X allow_other    EWF_MOUNT/ewf1, a read-only raw disk (FUSE)
+#   -> losetup -r                 a read-only loop device over the Windows partition
+#   -> mount -t ntfs-3g           MOUNT_POINT with ro,noexec,nodev,nosuid,show_sys_files,
+#                                 streams_interface=windows ($MFT and $Extend visible,
+#                                 alternate data streams readable as file:stream)
+#
+# The Windows partition is the NTFS partition that holds
+# Windows/System32/config/SYSTEM; its offset is found each time and never printed.
+# Safety is checked from the mount table (options ro, noexec, nodev, nosuid; loop
+# device read-only), never by trying to write or run anything.
+#
+# The last line of output is "RESULT <code> <text>"; the exit code is <code>:
+#   0 done   10 already mounted   11 nothing was mounted   2 usage
+#   20 image segment missing   21 mount point in use by something else
+#   22 mount point not empty   23 ewfmount failed   24 Windows partition not found
+#   25 losetup failed   26 ntfs-3g failed   27 not read-only/noexec   30 busy   31 other
+set -u -o pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C
+
+ACTION=${1:-}
+IMAGE=${2:-}
+EWF=${3:-}
+MNT=${4:-}
+RAW="$EWF/ewf1"
+NTFS_OPTS=ro,noexec,nodev,nosuid,show_sys_files,streams_interface=windows
+
+result() { echo "RESULT $1 $2"; exit "$1"; }
+log() { echo "disk-mount: $*"; }
+
+[ "$(id -u)" -eq 0 ] || result 2 "must run as root"
+case "$ACTION" in mount|unmount) ;; *) result 2 "usage: disk-mount mount|unmount IMAGE EWF_MOUNT MOUNT_POINT" ;; esac
+for p in "$IMAGE" "$EWF" "$MNT"; do
+    case "$p" in /*) ;; *) result 2 "paths must be absolute: '$p'" ;; esac
+    case "$p" in *[[:space:]]*|*..*|/) result 2 "path not allowed: '$p'" ;; esac
+done
+
+is_mounted() { findmnt -rn --mountpoint "$1" > /dev/null 2>&1; }
+mount_count() { findmnt -rn --mountpoint "$1" 2> /dev/null | wc -l; }
+ewf_alive() { is_mounted "$EWF" && head -c 512 "$RAW" > /dev/null 2>&1; }
+loops_for_raw() { losetup -nO NAME,BACK-FILE 2> /dev/null | awk -v f="$RAW" '$2 == f {print $1}'; }
+mnt_source() { findmnt -rn -o SOURCE --mountpoint "$MNT" 2> /dev/null | tail -n 1; }
+mnt_opts() { findmnt -rn -o VFS-OPTIONS --mountpoint "$MNT" 2> /dev/null | tail -n 1; }
+has_opt() { mnt_opts | tr ',' '\n' | grep -qx "$1"; }
+# MOUNT_POINT is mounted from a loop device whose backing file is our ewf1.
+ours() { local s; s=$(mnt_source); [ -n "$s" ] && loops_for_raw | grep -qxF -e "$s"; }
+safe() {
+    has_opt ro && has_opt noexec && has_opt nodev && has_opt nosuid || return 1
+    local src
+    src=$(mnt_source)
+    case "$src" in /dev/loop[0-9]*) ;; *) return 1 ;; esac
+    [ "$(losetup -nO RO "$src" 2> /dev/null | tr -d ' ')" = "1" ]
+}
+
+find_part_start() {
+    local s
+    for s in $(mmls "$RAW" 2> /dev/null | awk '$1 ~ /^[0-9]+:$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ {print $3 + 0}'); do
+        fsstat -o "$s" "$RAW" 2> /dev/null | grep -q 'File System Type: NTFS' || continue
+        [[ $(ifind -o "$s" -n /Windows/System32/config/SYSTEM "$RAW" 2> /dev/null) =~ ^[0-9]+$ ]] && { echo "$s"; return 0; }
+    done
+    return 1
+}
+part_len() { mmls "$RAW" 2> /dev/null | awk -v s="$1" '$1 ~ /^[0-9]+:$/ && $3 + 0 == s {print $5 + 0; exit}'; }
+
+release_ewf() {   # undo ewfmount and loops when nothing is mounted on top
+    is_mounted "$MNT" && return 0
+    local l
+    for l in $(loops_for_raw); do losetup -d "$l" 2> /dev/null; done
+    is_mounted "$EWF" && { fusermount -u "$EWF" 2> /dev/null || umount "$EWF" 2> /dev/null; }
+    return 0
+}
+
+do_mount() {
+    [ -r "$IMAGE" ] || result 20 "image segment missing: $IMAGE"
+    local e02="${IMAGE%.E01}.E02"
+    [ -r "$e02" ] || result 20 "image segment missing: $e02"
+    local n
+    n=$(mount_count "$MNT")
+    if [ "$n" -gt 0 ]; then
+        if [ "$n" -eq 1 ] && ewf_alive && ours; then
+            safe && result 10 "already mounted read-only at $MNT"
+            result 27 "$MNT is mounted from the image but the mount table does not show ro,noexec,nodev,nosuid on a read-only loop device"
+        fi
+        result 21 "$MNT is already in use ($n mount(s): $(findmnt -rn -o SOURCE,FSTYPE --mountpoint "$MNT" | tr '\n' ';'))"
+    fi
+    mkdir -p "$EWF" "$MNT"
+    [ -z "$(ls -A "$MNT" 2> /dev/null)" ] || result 22 "$MNT is not empty"
+    if is_mounted "$EWF" && ! ewf_alive; then
+        log "clearing a stale ewfmount on $EWF"
+        fusermount -uz "$EWF" 2> /dev/null || umount -l "$EWF" 2> /dev/null
+    fi
+    if ! ewf_alive; then
+        is_mounted "$EWF" && result 23 "$EWF is in use"
+        [ -z "$(ls -A "$EWF" 2> /dev/null)" ] || result 22 "$EWF is not empty"
+        ewfmount -X allow_other "$IMAGE" "$EWF" > /dev/null 2>&1 || result 23 "ewfmount failed"
+        local i
+        for i in $(seq 1 20); do ewf_alive && break; sleep 0.5; done
+        ewf_alive || result 23 "ewfmount did not present $RAW"
+    fi
+    local start len loop
+    start=$(find_part_start) || { release_ewf; result 24 "no NTFS partition with Windows/System32/config/SYSTEM"; }
+    len=$(part_len "$start")
+    [[ $len =~ ^[0-9]+$ ]] || { release_ewf; result 24 "partition length not found"; }
+    loop=$(losetup -nO NAME,OFFSET,RO,BACK-FILE 2> /dev/null |
+           awk -v f="$RAW" -v o=$((start * 512)) '$4 == f && $2 == o && $3 == 1 {print $1; exit}')
+    if [ -z "$loop" ]; then
+        loop=$(losetup -f --show -r -o $((start * 512)) --sizelimit $((len * 512)) "$RAW") ||
+            { release_ewf; result 25 "losetup failed"; }
+    fi
+    if ! mount -t ntfs-3g -o "$NTFS_OPTS" "$loop" "$MNT" > /dev/null 2>&1; then
+        release_ewf
+        result 26 "ntfs-3g mount failed"
+    fi
+    if ! safe; then
+        umount "$MNT" 2> /dev/null
+        release_ewf
+        result 27 "the mount table does not show ro,noexec,nodev,nosuid on a read-only loop device; unmounted again"
+    fi
+    result 0 "mounted read-only at $MNT"
+}
+
+do_unmount() {
+    local did=0
+    while is_mounted "$MNT"; do
+        ours || result 31 "$MNT is mounted from something other than this image; it was left alone"
+        if ! umount "$MNT" 2> /dev/null; then
+            result 30 "$MNT is busy"
+        fi
+        did=1
+        log "unmounted $MNT"
+    done
+    local l
+    for l in $(loops_for_raw); do losetup -d "$l" && { did=1; log "detached $l"; }; done
+    if is_mounted "$EWF"; then
+        fusermount -u "$EWF" 2> /dev/null || umount "$EWF" 2> /dev/null || result 31 "could not unmount $EWF"
+        did=1
+        log "unmounted $EWF"
+    fi
+    [ -z "$(loops_for_raw)" ] || result 31 "a loop device is still attached: $(loops_for_raw | tr '\n' ' ')"
+    [ "$did" -eq 1 ] && result 0 "unmounted"
+    result 11 "nothing was mounted"
+}
+
+case "$ACTION" in
+    mount) do_mount ;;
+    unmount) do_unmount ;;
+esac
+result 31 "internal error"

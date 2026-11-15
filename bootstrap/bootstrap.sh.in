@@ -3,9 +3,10 @@
 #
 # Turns an untouched SANS SIFT Workstation VM into a ready lab machine:
 # Claude Code (pinned version), Protocol SIFT, the dfir-lab toolkit, the case
-# files, and a few desktop settings. Safe to run any number of times.
+# files, the domain controller's disk image (unpacked, read-only), and a few
+# desktop settings. Safe to run any number of times.
 #
-#   bash bootstrap.sh [--yes] [--kit PATH]
+#   bash bootstrap.sh [--yes] [--kit PATH] [--image PATH]
 #   bash bootstrap.sh --uninstall [--purge] [--yes]
 #
 # GENERATED FILE: dist/bootstrap.sh is built by bootstrap/build.py from
@@ -26,6 +27,10 @@ umask 022
 
 PAYLOAD_MARKER="__DFIR_LAB_PAYLOAD""_BELOW__"
 CASE_DIR="/cases/$R_CASE_ID"
+DISK_DIR="$CASE_DIR/disk"
+DISK_STAGING="/cases/.$R_CASE_ID-disk.staging"
+UPDATE_AUTOSTART="$HOME/.config/autostart/update-notifier.desktop"
+RELEASE_UPGRADES="/etc/update-manager/release-upgrades"
 STATE_DIR="$HOME/dfir-lab"
 LOG_DIR="$STATE_DIR/logs"
 CLAUDE_BIN="$HOME/.local/bin/claude"
@@ -36,7 +41,7 @@ STUDENT_DIRS="analysis reports exports .claude"
 BROWSER_DESKTOP="chromium_chromium.desktop"
 BASHRC_BEGIN="# >>> dfir-lab setup (CYBERSEC 510) >>>"
 BASHRC_END="# <<< dfir-lab setup (CYBERSEC 510) <<<"
-TOTAL_STEPS=8
+TOTAL_STEPS=9
 MIN_FREE_GB=3
 
 SELF=""
@@ -45,6 +50,7 @@ WORK=""
 PAYLOAD=""
 YES=0
 KIT_ARG=""
+IMAGE_ARG=""
 MODE="setup"
 PURGE=0
 CHANGED=0
@@ -52,6 +58,7 @@ CLAUDE_OK=0
 PSIFT_OK=0
 TOOLKIT_OK=0
 CASE_OK=0
+IMAGE_OK=0
 CLAUDE_FOUND=""
 INCOMPLETE=()
 WARNINGS=()
@@ -129,7 +136,7 @@ die() {  # stop with an error (exit 3)
 cleanup() {
     if [ -n "$WORK" ] && [ -d "$WORK" ]; then rm -rf "$WORK" 2>/dev/null; fi
     sudo -n rm -rf "/cases/.$R_CASE_ID.staging" "/cases/.$R_CASE_ID.unzip" \
-        "/cases/.$R_CASE_ID.old" 2>/dev/null || true
+        "/cases/.$R_CASE_ID.old" "$DISK_STAGING" 2>/dev/null || true
 }
 
 on_interrupt() {
@@ -143,12 +150,15 @@ usage() {
     cat <<EOF
 CYBERSEC 510 DFIR lab setup, version $R_VERSION
 
-  bash bootstrap.sh [--yes] [--kit PATH]
+  bash bootstrap.sh [--yes] [--kit PATH] [--image PATH]
   bash bootstrap.sh --uninstall [--purge] [--yes]
 
-  --kit PATH    use this case kit zip (default: look for $R_CASE_KIT_PATTERN
-                in ~/Downloads, ~/Desktop and your home folder)
-  --yes         answer yes to questions (for automation)
+  --kit PATH    use this case kit zip (default: an accepted $R_CASE_KIT_PATTERN
+                in ~/Downloads, ~/Desktop or your home folder, else download it)
+  --image PATH  use this disk image zip (default: look for $R_IMAGE_ZIP_PATTERN
+                in the same places)
+  --yes         answer yes to questions (for automation); keeps the disk
+                image zip instead of offering to delete it
   --uninstall   remove the lab toolkit, the case folder and the .bashrc
                 change; keep Claude Code, Protocol SIFT, your Duke AI key and
                 your work (analysis/, reports/, exports/)
@@ -168,6 +178,9 @@ parse_args() {
             --kit) [ $# -ge 2 ] || { echo "--kit needs a file name" >&2; exit 2; }
                    KIT_ARG=$2; shift 2 ;;
             --kit=*) KIT_ARG=${1#--kit=}; shift ;;
+            --image) [ $# -ge 2 ] || { echo "--image needs a file name" >&2; exit 2; }
+                     IMAGE_ARG=$2; shift 2 ;;
+            --image=*) IMAGE_ARG=${1#--image=}; shift ;;
             --uninstall) MODE="uninstall"; shift ;;
             --purge) PURGE=1; shift ;;
             --version) echo "$R_VERSION"; exit 0 ;;
@@ -180,6 +193,9 @@ parse_args() {
     fi
     if [ -n "$KIT_ARG" ]; then
         case "$KIT_ARG" in /*) ;; *) KIT_ARG="$PWD/$KIT_ARG" ;; esac
+    fi
+    if [ -n "$IMAGE_ARG" ]; then
+        case "$IMAGE_ARG" in /*) ;; *) IMAGE_ARG="$PWD/$IMAGE_ARG" ;; esac
     fi
 }
 
@@ -311,7 +327,7 @@ preflight() {
     # Network: the hosts the setup downloads from. A failure is reported here
     # and again by the step that needs the host.
     local h code unreachable=()
-    for h in claude.ai downloads.claude.ai github.com; do
+    for h in claude.ai downloads.claude.ai github.com raw.githubusercontent.com; do
         code=$(curl -s -o /dev/null -I --connect-timeout 8 -m 15 -w '%{http_code}' "https://$h/" 2>/dev/null)
         log "network probe https://$h/ -> HTTP ${code:-000}"
         [ "${code:-000}" != "000" ] || unreachable+=("$h")
@@ -338,8 +354,60 @@ wait_apt_lock() {
     return 0
 }
 
+update_autostart_text() {
+    cat <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Update Notifier
+Exec=update-notifier
+Hidden=true
+X-GNOME-Autostart-enabled=false
+# Added by the CYBERSEC 510 lab setup script: no Software Updater pop-ups during the
+# lab. "bash bootstrap.sh --uninstall" removes this file.
+EOF
+}
+
+# Ubuntu's Software Updater pops up a few minutes after the package lists are
+# refreshed (update-notifier launches update-manager), and a "new Ubuntu release"
+# dialog appears too. Neither installs anything by itself, but both distract and
+# invite a 9 GB upgrade in the middle of the lab. Nothing is upgraded here.
+quiet_updates() {
+    local did=0 uid
+    uid=$(id -u)
+    # The release-upgrade prompt: Prompt=never is the setting documented in the
+    # file; check-new-release-gtk then does nothing.
+    if [ -f "$RELEASE_UPGRADES" ] && ! grep -qx 'Prompt=never' "$RELEASE_UPGRADES"; then
+        if run sudo sed -i 's/^Prompt=.*/Prompt=never/' "$RELEASE_UPGRADES" && \
+           grep -qx 'Prompt=never' "$RELEASE_UPGRADES"; then
+            did=1
+        else
+            warn "could not turn off the new-Ubuntu-release prompt; if a window offers an upgrade, close it"
+        fi
+    fi
+    # update-notifier is what opens the Software Updater; keep it from starting
+    # at login (a user autostart entry with the same name and Hidden=true) ...
+    if [ "$(cat "$UPDATE_AUTOSTART" 2>/dev/null)" != "$(update_autostart_text)" ]; then
+        mkdir -p "$(dirname "$UPDATE_AUTOSTART")" && update_autostart_text > "$UPDATE_AUTOSTART" && did=1
+    fi
+    # ... and stop the copy that is running now, with any updater window it opened.
+    if pgrep -u "$uid" -x update-notifier > /dev/null 2>&1 || \
+       pgrep -u "$uid" -f '^/usr/bin/python3 /usr/(bin/update-manager|lib/ubuntu-release-upgrader/check-new-release-gtk)' > /dev/null 2>&1; then
+        pkill -u "$uid" -x update-notifier 2>/dev/null
+        pkill -u "$uid" -f '^/usr/bin/python3 /usr/(bin/update-manager|lib/ubuntu-release-upgrader/check-new-release-gtk)' 2>/dev/null
+        did=1
+    fi
+    log "release-upgrades: $(grep '^Prompt=' "$RELEASE_UPGRADES" 2>/dev/null); autostart override: $([ -f "$UPDATE_AUTOSTART" ] && echo present)"
+    if [ "$did" -eq 1 ]; then
+        ok "turned off the Software Updater pop-ups and the new-release prompt (nothing is upgraded)"
+        changed
+    else
+        done_already "the Software Updater pop-ups and the new-release prompt are off"
+    fi
+}
+
 packages() {
     step 2 "Installing missing system packages (copy and paste support)"
+    quiet_updates
     local need=()
     dpkg-query -W -f='${Status}' open-vm-tools-desktop 2>/dev/null | grep -q "install ok installed" \
         || need+=(open-vm-tools-desktop)
@@ -573,7 +641,7 @@ fix_case_permissions() {
     local d=$1 u g s
     u=$(id -un); g=$(id -gn)
     local prune=()
-    for s in $STUDENT_DIRS; do prune+=(! -name "$s"); done
+    for s in $STUDENT_DIRS disk; do prune+=(! -name "$s"); done
     run sudo find "$d" -mindepth 1 -maxdepth 1 "${prune[@]}" -exec chown -R root:root {} + || return 1
     run sudo find "$d" -mindepth 1 -maxdepth 1 "${prune[@]}" -exec chmod -R u+rwX,go+rX,go-w {} + || return 1
     run sudo chown root:root "$d" && run sudo chmod 755 "$d" || return 1
@@ -603,7 +671,7 @@ case_verified() {
     # Nothing outside the working folders may be writable by the student.
     local w
     w=$(find "$CASE_DIR" \( -path "$CASE_DIR/analysis" -o -path "$CASE_DIR/reports" -o \
-            -path "$CASE_DIR/exports" -o -path "$CASE_DIR/.claude" \) -prune -o -writable -print 2>/dev/null | head -n 3)
+            -path "$CASE_DIR/exports" -o -path "$CASE_DIR/.claude" -o -path "$CASE_DIR/disk" \) -prune -o -writable -print 2>/dev/null | head -n 3)
     [ -z "$w" ] || { log "case: writable by the student: $w"; return 1; }
     local s
     for s in $STUDENT_DIRS; do
@@ -718,7 +786,7 @@ install_kit() {
     # Keep the student's work from an earlier installation.
     local s
     if [ -d "$CASE_DIR/.dfir-lab" ]; then
-        for s in $STUDENT_DIRS; do
+        for s in $STUDENT_DIRS disk; do
             if [ -e "$CASE_DIR/$s" ]; then sudo rm -rf "$staging/$s"; run sudo mv "$CASE_DIR/$s" "$staging/$s"; fi
         done
     fi
@@ -735,6 +803,45 @@ install_kit() {
     fi
     run sudo mv "$staging" "$CASE_DIR" || return 1
     sudo rm -rf "/cases/.$R_CASE_ID.old"
+    return 0
+}
+
+# Downloads the kit from the release this script belongs to (R_CASE_KIT_URL)
+# and accepts it only if its SHA-256 is in R_CASE_KIT_SHA256. An unverified kit
+# is never installed. DFIR_LAB_KIT_URL replaces the URL for tests only (the
+# repository is private until release, so the real URL answers 404 before then).
+download_kit() {
+    local url="${DFIR_LAB_KIT_URL:-$R_CASE_KIT_URL}" name dest code sum
+    name=$(basename -- "$R_CASE_KIT_URL")
+    dest="$WORK/download/$name"
+    mkdir -p "$WORK/download"
+    [ "$url" = "$R_CASE_KIT_URL" ] || log "kit URL overridden for testing by DFIR_LAB_KIT_URL"
+    out "      downloading the case kit ($name, about 8 MB)..."
+    code=$(curl -sSL --retry 3 --connect-timeout 15 -m 300 -o "$dest" -w '%{http_code}' "$url" 2>> "$LOG")
+    local rc=$?
+    log "kit download $url -> curl exit $rc, HTTP ${code:-000}"
+    if [ "$rc" -ne 0 ] || [ "${code:-000}" != "200" ]; then
+        rm -f "$dest"
+        if [ "$rc" -ne 0 ] && [ "${code:-000}" = "000" ]; then
+            incomplete "the case kit could not be downloaded (no connection to $(printf '%s' "$url" | cut -d/ -f3))." \
+                "Check that the VM has internet, then run the same setup command again."
+        else
+            incomplete "the case kit could not be downloaded (the server answered HTTP ${code:-000})." \
+                "Run the same setup command again in a few minutes; if it happens again, tell the TA and send the log."
+        fi
+        return 1
+    fi
+    sum=$(sha256sum -- "$dest" | cut -c1-64)
+    log "downloaded kit sha256=$sum ($(stat -c %s -- "$dest") bytes)"
+    if ! kit_hash_accepted "$sum"; then
+        rm -f "$dest"
+        incomplete "the downloaded case kit does not match its expected SHA-256, so it was not installed." \
+            "Run the same setup command again; if it happens again, tell the TA and send the log."
+        return 1
+    fi
+    ok "downloaded the case kit and verified its SHA-256"
+    KIT_FOUND=$dest
+    KIT_FOUND_SHA=$sum
     return 0
 }
 
@@ -763,16 +870,16 @@ case_kit() {
     if [ "$v" -eq 0 ]; then CASE_OK=1; return; fi
 
     [ -z "$KIT_ARG" ] && find_kit
-    if [ -z "$KIT_FOUND" ]; then
-        if [ ${#KIT_REJECTED[@]} -gt 0 ]; then
-            incomplete "the case kit file ${KIT_REJECTED[0]} is damaged or not the current version." \
-                "Delete it, download $R_CASE_KIT_PATTERN again from the course site inside this VM, then run the same setup command again."
-        else
-            incomplete "the case kit is not on this VM yet." \
-                "Inside this VM, download the case kit ($R_CASE_KIT_PATTERN) from the course site; it goes to ~/Downloads. Then run the same setup command again."
-        fi
+    if [ -z "$KIT_FOUND" ] && [ -n "$KIT_ARG" ]; then
+        incomplete "the case kit file $KIT_ARG is damaged or not the current version." \
+            "Leave --kit out: the setup then downloads the kit itself. Run the same setup command again."
         return
     fi
+    # No accepted kit on this VM: download it from the same release as this script.
+    [ -z "$KIT_FOUND" ] && download_kit
+    [ -n "$KIT_FOUND" ] || return
+    case "$KIT_FOUND" in "$WORK"/*) [ ${#KIT_REJECTED[@]} -eq 0 ] ||
+        note "ignored ${KIT_REJECTED[0]}: it is not the current case kit (you can delete it)" ;; esac
     if ! install_kit; then
         [ ${#INCOMPLETE[@]} -gt 0 ] || incomplete "the case files could not be installed." \
             "Run the same setup command again; if it happens again, tell the TA and send the log."
@@ -790,7 +897,205 @@ case_kit() {
 }
 
 # ---------------------------------------------------------------------------
-# Step 7: desktop comfort
+# Step 7: disk image
+# ---------------------------------------------------------------------------
+
+IMAGE_FOUND=""
+IMAGE_REJECTED=()
+IMAGE_KEPT_NOTE=""
+
+gb() { awk -v b="$1" 'BEGIN { printf "%.1f", b / 1073741824 }'; }
+
+# "hash  name" lines for every image file, for sha256sum -c.
+image_sums() {
+    local item
+    for item in $R_IMAGE_FILES; do printf '%s  %s\n' "${item#*:}" "${item%%:*}"; done
+}
+
+# The short links: DC01.E01 -> <long name>.E01, DC01.E02 -> <long name>.E02, ...
+image_links() {
+    local item name
+    for item in $R_IMAGE_FILES; do
+        name=${item%%:*}
+        case "$name" in *.E[0-9][0-9]) printf '%s %s\n' "$R_IMAGE_SHORT_NAME.${name##*.}" "$name" ;; esac
+    done
+}
+
+# Checks an unpacked image folder ($1): every file present, root-owned, mode
+# 444, matching its SHA-256; the short links in place; the folder root-owned
+# and not writable by anyone else.
+image_folder_ok() {
+    local d=$1 item name link target
+    [ -d "$d" ] && [ "$(stat -c '%U %a' -- "$d")" = "root 755" ] || { log "image: folder $d missing or wrong mode"; return 1; }
+    for item in $R_IMAGE_FILES; do
+        name=${item%%:*}
+        [ -f "$d/$name" ] && [ ! -L "$d/$name" ] || { log "image: $name missing"; return 1; }
+        [ "$(stat -c '%U %a' -- "$d/$name")" = "root 444" ] || { log "image: $name not root-owned read-only"; return 1; }
+    done
+    while read -r link target; do
+        [ "$(readlink -- "$d/$link" 2>/dev/null)" = "$target" ] || { log "image: link $link missing"; return 1; }
+    done < <(image_links)
+    (cd "$d" && image_sums | sha256sum -c --status --strict) 2>/dev/null || { log "image: checksums differ"; return 1; }
+    return 0
+}
+
+find_image() {
+    local candidates=() f d sum size newest=0 m
+    if [ -n "$IMAGE_ARG" ]; then
+        [ -f "$IMAGE_ARG" ] && candidates+=("$IMAGE_ARG")
+    else
+        local old
+        old=$(shopt -p nullglob); shopt -s nullglob
+        for d in "$HOME/Downloads" "$HOME/Desktop" "$HOME"; do
+            for f in "$d"/$R_IMAGE_ZIP_PATTERN; do [ -f "$f" ] && candidates+=("$f"); done
+        done
+        eval "$old"
+    fi
+    for f in "${candidates[@]}"; do
+        size=$(stat -L -c %s -- "$f")
+        if [ "$size" != "$R_IMAGE_ZIP_SIZE" ]; then
+            log "image candidate $f has $size bytes, expected $R_IMAGE_ZIP_SIZE"
+            IMAGE_REJECTED+=("$f")
+            continue
+        fi
+        out "      checking $f ($(gb "$size") GB; this takes up to a minute)..."
+        sum=$(sha256sum -- "$f" | cut -c1-64)
+        log "image candidate $f sha256=$sum"
+        if [ "$sum" = "$R_IMAGE_ZIP_SHA256" ]; then
+            m=$(stat -c %Y -- "$f")
+            if [ "$m" -ge "$newest" ]; then newest=$m; IMAGE_FOUND=$f; fi
+        else
+            IMAGE_REJECTED+=("$f")
+        fi
+    done
+}
+
+# The case folder must exist (and be ours) before the image goes into it. When
+# the kit is not installed yet, an empty case folder marked with .dfir-lab/ is
+# created; installing the kit later carries disk/ over.
+ensure_case_folder() {
+    if [ -e "$CASE_DIR" ] && [ ! -d "$CASE_DIR/.dfir-lab" ]; then
+        local aside
+        aside="/cases/$R_CASE_ID.before-setup-$(date +%Y%m%d%H%M%S)"
+        run sudo mv "$CASE_DIR" "$aside" || return 1
+        NOTES+=("A folder $CASE_DIR that the setup did not create was moved to $aside.")
+    fi
+    sudo mkdir -p "$CASE_DIR/.dfir-lab" && run sudo chown root:root "$CASE_DIR" "$CASE_DIR/.dfir-lab" &&
+        run sudo chmod 755 "$CASE_DIR" "$CASE_DIR/.dfir-lab"
+}
+
+install_image() {
+    local zip=$IMAGE_FOUND dir=$R_IMAGE_ZIP_DIR list item name members=() expected
+    # Free space: the unpacked files plus a margin, on the file system of /cases.
+    local need=$((R_IMAGE_UNPACKED_BYTES + 536870912)) free_kb
+    sudo mkdir -p /cases
+    free_kb=$(df -Pk /cases | awk 'NR==2 {print $4}')
+    log "image: free on /cases: $((free_kb / 1024)) MB, needed $((need / 1048576)) MB"
+    if [ -n "$free_kb" ] && [ $((free_kb * 1024)) -lt "$need" ]; then
+        incomplete "there is not enough free disk space to unpack the disk image: it needs $(gb "$need") GB, and only $(gb $((free_kb * 1024))) GB is free." \
+            "Delete large files you do not need (not the disk image zip), then run the same setup command again."
+        return 1
+    fi
+    # The zip must hold exactly the expected folder and files: no other paths, no links.
+    list=$(unzip -Z1 "$zip" 2>> "$LOG") || { log "image: not a readable zip"; list=""; }
+    expected=$(printf '%s/\n' "$dir"; for item in $R_IMAGE_FILES; do printf '%s/%s\n' "$dir" "${item%%:*}"; done)
+    if [ -z "$list" ] || [ "$(printf '%s\n' "$list" | LC_ALL=C sort)" != "$(printf '%s\n' "$expected" | LC_ALL=C sort)" ] || \
+       unzip -Z "$zip" 2>/dev/null | grep -q '^l'; then
+        log "image: unexpected zip contents: $(printf '%s' "$list" | tr '\n' ' ')"
+        incomplete "the disk image file $zip does not contain what the lab expects." \
+            "Download $R_IMAGE_ZIP_NAME again from the course site; if it happens again, tell the TA."
+        return 1
+    fi
+    for item in $R_IMAGE_FILES; do members+=("$dir/${item%%:*}"); done
+    sudo rm -rf "$DISK_STAGING"
+    sudo mkdir -p "$DISK_STAGING" || return 1
+    out "      unpacking the disk image ($(gb "$R_IMAGE_UNPACKED_BYTES") GB; this takes a minute or two)..."
+    if ! run sudo unzip -q -j "$zip" "${members[@]}" -d "$DISK_STAGING"; then
+        incomplete "the disk image could not be unpacked." \
+            "Download $R_IMAGE_ZIP_NAME again from the course site, then run the same setup command again."
+        return 1
+    fi
+    # Root owns it; nobody can change it (mode 444 files in a 755 folder).
+    run sudo chown -R root:root "$DISK_STAGING" && run sudo chmod 755 "$DISK_STAGING" || return 1
+    for item in $R_IMAGE_FILES; do run sudo chmod 444 "$DISK_STAGING/${item%%:*}" || return 1; done
+    local link target
+    while read -r link target; do
+        run sudo ln -sfn "$target" "$DISK_STAGING/$link" || return 1
+    done < <(image_links)
+    if ! image_folder_ok "$DISK_STAGING"; then
+        incomplete "the unpacked disk image does not match its checksums: the download is damaged." \
+            "Delete $zip, download $R_IMAGE_ZIP_NAME again from the course site, then run the same setup command again."
+        return 1
+    fi
+    ensure_case_folder || return 1
+    sudo rm -rf "$DISK_DIR"
+    run sudo mv "$DISK_STAGING" "$DISK_DIR" || return 1
+    return 0
+}
+
+offer_zip_delete() {
+    local zip=$IMAGE_FOUND size
+    case "$zip" in "$HOME"/*) ;; *) return ;; esac
+    [ -w "$(dirname -- "$zip")" ] || return
+    size=$(gb "$(stat -c %s -- "$zip")")
+    if [ "$YES" -eq 1 ]; then
+        note "kept $zip (--yes keeps it); delete it yourself to free $size GB"
+        return
+    fi
+    if [ -t 0 ]; then
+        local ans=""
+        read -r -p "      The lab now uses the unpacked copy. Delete $zip to free $size GB? [Y/n] " ans
+        log "answer: $ans"
+        case "$ans" in
+            ""|[Yy]*) if rm -f -- "$zip"; then ok "deleted $zip ($size GB freed)"; changed
+                      else warn "could not delete $zip"; fi ;;
+            *) note "kept $zip; you can delete it later to free $size GB" ;;
+        esac
+    else
+        note "kept $zip; you can delete it to free $size GB (the lab uses the unpacked copy)"
+    fi
+}
+
+disk_image() {
+    step 7 "Installing the disk image ($R_IMAGE_ZIP_NAME, about 5 GB)"
+    out "      The disk image holds live malware from a real intrusion: keep it inside this VM, never copy it to your own computer."
+    if [ -n "$IMAGE_ARG" ] && [ ! -f "$IMAGE_ARG" ]; then
+        incomplete "the disk image file $IMAGE_ARG does not exist." \
+            "Check the file name after --image, or leave --image out to search ~/Downloads."
+        return
+    fi
+    if [ -d "$DISK_DIR" ]; then
+        out "      checking the installed disk image ($(gb "$R_IMAGE_UNPACKED_BYTES") GB)..."
+        if image_folder_ok "$DISK_DIR"; then
+            done_already "the disk image is in $DISK_DIR ($(image_sums | wc -l) files verified, read-only)"
+            IMAGE_OK=1
+            return
+        fi
+    fi
+    find_image
+    if [ -z "$IMAGE_FOUND" ]; then
+        if [ ${#IMAGE_REJECTED[@]} -gt 0 ]; then
+            incomplete "the disk image file ${IMAGE_REJECTED[0]} is damaged or incomplete (a download may have been cut short)." \
+                "Delete it, download $R_IMAGE_ZIP_NAME again from the course site inside this VM, wait until the download has finished, then run the same setup command again."
+        else
+            incomplete "the disk image is not on this VM yet." \
+                "Inside this VM, download the disk image ($R_IMAGE_ZIP_NAME, $(gb "$R_IMAGE_ZIP_SIZE") GB) from the course site; it goes to ~/Downloads. Then run the same setup command again."
+        fi
+        return
+    fi
+    if ! install_image; then
+        [ ${#INCOMPLETE[@]} -gt 0 ] || incomplete "the disk image could not be installed." \
+            "Run the same setup command again; if it happens again, tell the TA and send the log."
+        return
+    fi
+    ok "disk image installed in $DISK_DIR (read-only; $R_IMAGE_SHORT_NAME.E01 is the short name)"
+    IMAGE_OK=1
+    changed
+    offer_zip_delete
+}
+
+# ---------------------------------------------------------------------------
+# Step 8: desktop comfort
 # ---------------------------------------------------------------------------
 
 gio_attr() {  # $1 file, $2 attribute -> value
@@ -841,7 +1146,7 @@ remove_bashrc_block() {
 }
 
 desktop() {
-    step 7 "Adjusting the desktop for the lab"
+    step 8 "Adjusting the desktop for the lab"
     if ! session_env; then
         warn "no desktop session was found, so the desktop settings were skipped. Run the setup command again from a terminal on the VM desktop."
         return
@@ -944,11 +1249,11 @@ desktop() {
 }
 
 # ---------------------------------------------------------------------------
-# Step 8: readiness check and summary
+# Step 9: readiness check and summary
 # ---------------------------------------------------------------------------
 
 finish_checks() {
-    step 8 "Checking the result"
+    step 9 "Checking the result"
     if [ "$TOOLKIT_OK" -ne 1 ] || ! command -v dfir-lab > /dev/null 2>&1; then
         out "      skipped: the lab toolkit is not installed"
         return
@@ -974,9 +1279,10 @@ finish_checks() {
         todo=$(printf '%s' "$json" | jq -r ".results[] | select(.id == $id) | .todo")
         name=$(printf '%s' "$json" | jq -r ".results[] | select(.id == $id) | .name")
         [ -n "$status" ] || continue
-        if [ "$CASE_OK" -ne 1 ] && { [ "$id" = 2 ] || [ "$id" = 3 ]; } && [ "$status" != "PASS" ]; then
-            # Follows from the missing case files, which are already listed.
-            out "      waiting: $name (needs the case files)"
+        if [ "$status" != "PASS" ] && { { [ "$CASE_OK" -ne 1 ] && { [ "$id" = 2 ] || [ "$id" = 3 ]; }; } ||
+                                         { [ "$IMAGE_OK" -ne 1 ] && [ "$id" = 3 ]; }; }; then
+            # Follows from the missing case files or disk image, which are already listed.
+            out "      waiting: $name (needs the case files and the disk image)"
             continue
         fi
         case "$id:$status" in
@@ -1010,10 +1316,13 @@ summary() {
     [ "$PSIFT_OK" -eq 1 ] && psift="${R_PROTOCOL_SIFT_COMMIT:0:7}   (~/.claude)"
     [ "$TOOLKIT_OK" -eq 1 ] && tk="$R_VERSION   (dfir-lab, desktop shortcuts)"
     [ "$CASE_OK" -eq 1 ] && cs="$R_CASE_ID   ($CASE_DIR)"
+    local di="not installed"
+    [ "$IMAGE_OK" -eq 1 ] && di="$R_IMAGE_SHORT_NAME.E01   ($DISK_DIR; mount: dfir-lab mount)"
     out "   Claude Code     $cc"
     out "   Protocol SIFT   $psift"
     out "   Lab toolkit     $tk"
     out "   Case files      $cs"
+    out "   Disk image      $di"
     if [ ${#INCOMPLETE[@]} -gt 0 ]; then
         out ""
         out " Not finished:"
@@ -1073,6 +1382,19 @@ uninstall() {
         fi
     fi
     sudo -n true 2>/dev/null || sudo -v || die "administrator rights are needed."
+    # The disk image must be unmounted before its files are removed.
+    local ewf="/mnt/ewf_${R_IMAGE_SHORT_NAME,,}" res rc
+    res=$(sudo bash "$PAYLOAD/lab/libexec/disk-mount" unmount "$DISK_DIR/$R_IMAGE_SHORT_NAME.E01" \
+          "$ewf" "$R_IMAGE_MOUNT_POINT" 2>&1)
+    rc=$?
+    log "disk-mount unmount (exit $rc): $res"
+    case "$rc" in
+        0) out "  unmounted the disk image from $R_IMAGE_MOUNT_POINT" ;;
+        11) ;;
+        *) die "the disk image could not be unmounted from $R_IMAGE_MOUNT_POINT (${res##*RESULT })." \
+               "Close every terminal and program that uses a folder inside $R_IMAGE_MOUNT_POINT (or restart the VM), then run the same command again. Nothing was removed." ;;
+    esac
+    sudo rmdir "$R_IMAGE_MOUNT_POINT" "$ewf" 2>/dev/null || true
     local args=(--user "$(id -un)" --uninstall)
     [ "$PURGE" -eq 1 ] && args+=(--purge)
     if run sudo sh "$PAYLOAD/lab/install.sh" "${args[@]}"; then
@@ -1105,6 +1427,10 @@ uninstall() {
         fi
     fi
     if remove_bashrc_block; then out "  removed the lab block from ~/.bashrc"; fi
+    if [ -f "$UPDATE_AUTOSTART" ] && grep -q 'CYBERSEC 510 lab setup' "$UPDATE_AUTOSTART"; then
+        rm -f "$UPDATE_AUTOSTART"
+        out "  the Software Updater notifier starts again at the next login"
+    fi
     if [ "$PURGE" -eq 1 ]; then
         rm -rf "$HOME/.local/bin/claude" "$HOME/.local/share/claude" "$HOME/.cache/claude" \
                "$HOME/.claude" "$HOME/.claude.json" "$HOME/.claude.json.backup"
@@ -1112,7 +1438,8 @@ uninstall() {
     else
         out "  kept: Claude Code, Protocol SIFT (~/.claude), your Duke AI key and your work"
     fi
-    out "  not undone: the open-vm-tools-desktop package, the screen-lock and default-browser settings"
+    out "  not undone: the open-vm-tools-desktop package, the screen-lock and default-browser settings,"
+    out "  and Prompt=never in $RELEASE_UPGRADES (no new-release prompt)"
     out "Done."
     log "uninstall finished"
 }
@@ -1147,6 +1474,7 @@ main() {
     protocol_sift
     toolkit
     case_kit
+    disk_image
     desktop
     finish_checks
     summary

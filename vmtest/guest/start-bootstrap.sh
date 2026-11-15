@@ -6,14 +6,18 @@
 # on, as in a GNOME Terminal). It runs as a transient systemd user unit so it
 # keeps running if open-vm-tools restarts, and returns at once.
 #
-#   start-bootstrap.sh UNIT OUTDIR
+#   start-bootstrap.sh UNIT OUTDIR [pty]
 #
 # OUTDIR/command.txt must already hold the one-line command. Afterwards
 # OUTDIR/screen.txt has everything printed to the terminal and OUTDIR/rc the
 # exit code. OUTDIR/before.txt records time, bytes received and disk use.
+# With "pty", the command runs in a pseudo-terminal (pty-run.py, next to this
+# script) that answers its [Y/n] questions with y; otherwise stdin is /dev/null.
 set -u
 unit=$1
 out=$2
+mode=${3:-plain}
+here=$(cd "$(dirname "$0")" && pwd)
 uid=$(id -u)
 export XDG_RUNTIME_DIR=/run/user/$uid
 export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus
@@ -25,10 +29,14 @@ printf 'epoch=%s\nrx=%s\ndf_used=%s\n' "$(date +%s)" "$(rx)" "$(df -B1 --output=
 systemctl --user reset-failed "$unit.service" 2>/dev/null || true
 systemd-run --user --collect --quiet --unit="$unit" --working-directory="$HOME" \
     /bin/bash -c '
-        bash -i -c "$(cat "$1/command.txt")" > "$1/screen.txt" 2>&1 < /dev/null
+        if [ "$2" = pty ]; then
+            python3 "$3/pty-run.py" "$1" y
+        else
+            bash -i -c "$(cat "$1/command.txt")" > "$1/screen.txt" 2>&1 < /dev/null
+        fi
         rc=$?
         t=0; for f in /sys/class/net/*/statistics/rx_bytes; do
             case "$f" in */lo/*|*/docker*|*/veth*) continue ;; esac; read -r n < "$f"; t=$((t + n)); done
         printf "epoch=%s\nrx=%s\ndf_used=%s\n" "$(date +%s)" "$t" "$(df -B1 --output=used / | tail -n1 | tr -d " ")" > "$1/after.txt"
-        echo "$rc" > "$1/rc"' bash "$out"
+        echo "$rc" > "$1/rc"' bash "$out" "$mode" "$here"
 echo "started unit $unit (rc of systemd-run: $?)"

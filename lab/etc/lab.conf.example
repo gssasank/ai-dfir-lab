@@ -57,6 +57,21 @@ replay_dir = fallback                ; relative to dir; *.jsonl recordings for d
 worksheet =                          ; relative to dir, e.g. worksheet.md
 worksheet_template =                 ; relative to dir, e.g. worksheet.template.md
 ticket = ticket.md                   ; relative to dir; incident ticket shown in the start banner
+ai_report =                          ; relative to dir; AI-written report students audit, named
+                                     ; in the start banner (e.g. ai-report.md)
+
+[disk]
+; The case's disk image, mounted read-only and noexec by `dfir-lab mount` (and by
+; `dfir-lab start` when it is not mounted). Leave image empty when the case has none.
+image =                              ; first E01 segment, e.g. /cases/<id>/disk/DC01.E01; the
+                                     ; other segments (DC01.E02, ...) sit beside it
+segments =                           ; files in the image's folder and their SHA-256, checked by
+                                     ; readiness check 3: "name:sha256 name:sha256 ..."
+mount_point = /mnt/dc01              ; where the Windows volume is mounted (no spaces)
+ewf_mount =                          ; ewfmount folder (default: ewf_<name> beside mount_point)
+probe = Windows/System32/config/SYSTEM  ; file read through the mount to prove it works
+probe_magic = regf                   ; its first bytes
+zip_name =                           ; download name shown in messages, e.g. DC01-E01.zip
 
 [requirements]
 min_ram_mb = 5500                    ; below this: WARN

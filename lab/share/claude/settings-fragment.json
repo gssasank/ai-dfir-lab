@@ -14,7 +14,8 @@
       "Workflow",
       "ScheduleWakeup",
       "ReportFindings",
-      "ListAgents"
+      "ListAgents",
+      "Agent"
     ]
   },
   "hooks": {

@@ -4,33 +4,217 @@
   "checkpoints": [
     {
       "id": 1,
-      "title": "PLACEHOLDER checkpoint 1",
-      "question": "PLACEHOLDER: from which IP address did the remote logon in the stand-in evidence come?",
-      "normalize": "ip",
+      "title": "The Windows partition",
+      "question": "In 512-byte sectors, at which sector does the partition that contains Windows start?",
+      "normalize": "integer",
       "pattern": null,
       "then": null,
-      "salt": "e033ebb869167e19bf02e17d6e156fb5",
-      "hash": "eb0012da0369ce7589adb957c53d6cc67b0f5bba13d3f11752bdcf1fc00c4bba",
+      "salt": "2a408a1b5123f9b71fa23ce6709de2b4",
+      "hash": "debfd76c18a6f3fe26da4106335bace767eac5a253f4546e66d3fd6497f295d3",
       "alternates": [],
       "hints": [
-        "PLACEHOLDER hint: look at events 4624 and 4625."
+        "The image's partition table is read with `mmls`.",
+        "Two partitions are NTFS. The small first one only holds boot files. Windows is on the large one.",
+        "Run `mmls` on the E01 file and read the Start column for the large NTFS partition."
       ],
-      "success": "PLACEHOLDER: right. The real checkpoints are not written yet."
+      "success": "Correct. Every Sleuth Kit command on this image needs that offset. Picking the first NTFS partition is the classic mistake."
     },
     {
       "id": 2,
-      "title": "PLACEHOLDER checkpoint 2",
-      "question": "PLACEHOLDER: which event ID records the installation of a new service?",
-      "normalize": "exact",
+      "title": "Do the logs match the image?",
+      "question": "Compute the SHA-256 of `Security.evtx` inside the mounted image. What are its last 8 characters?",
+      "normalize": "casefold",
       "pattern": null,
       "then": null,
-      "salt": "94a16f64ff351d29ad9db9e593ec0f65",
-      "hash": "67fff656ba410a5de27a6a742c42d16fb811cbd98e7d6ea23844e03622c6d7a4",
+      "salt": "67c1a6de7c56f942a22cdd14eeb57a56",
+      "hash": "d288efdca92647fdb15acdfb640cf67f93ebd83dc342d597039094cc1960b625",
       "alternates": [],
       "hints": [
-        "PLACEHOLDER hint: look in the system events."
+        "Windows keeps its event logs in `Windows/System32/winevt/Logs` on the mounted image.",
+        "Use `sha256sum` on `Security.evtx` there.",
+        "Compare the result with the line for `evidence/DC01/evtx/Security.evtx` in `/cases/szechuan/MANIFEST.sha256`. The answer is the last 8 characters."
       ],
-      "success": "PLACEHOLDER: right. The real checkpoints are not written yet."
+      "success": "Correct, and it equals the hash in the log kit's manifest. You have shown that the logs you were given came from the image you verified."
+    },
+    {
+      "id": 3,
+      "title": "The failed logons",
+      "question": "How many Security 4625 (failed logon) records on DC01 have a WorkstationName of exactly `kali`?",
+      "normalize": "integer",
+      "pattern": null,
+      "then": null,
+      "salt": "52d2619b3153630e342c6025b6b28296",
+      "hash": "fad05a2baf44d7f6ff1caeb2648ddeeda7c45f5faf975b356fdc2e5e9a0f15dc",
+      "alternates": [],
+      "hints": [
+        "Failed logons are event 4625 in the Security log. The CSV is `derived/DC01/DC01-evtxecmd.csv`.",
+        "Look at the WorkstationName field of those records. Then look at what their IpAddress field contains.",
+        "Count the rows where the event ID is 4625, the channel is Security, and WorkstationName is `kali`."
+      ],
+      "success": "Correct. Notice that these records have no source address at all. Anyone who says \"95 failures from 194.61.24.102 in the Security log\" has not opened the records."
+    },
+    {
+      "id": 4,
+      "title": "The first way in",
+      "question": "Among DC01 Security 4624 records with IpAddress 194.61.24.102 and LogonType 10, what is the TargetLogonId of the earliest one?",
+      "normalize": "casefold",
+      "pattern": null,
+      "then": null,
+      "salt": "62de3bc5ff10fe294683577f0c4c0845",
+      "hash": "6e860c83ce3a3211d3716c5ec5a098c282f49f237c0e406e0e3f785812053220",
+      "alternates": [
+        "9592c11a070a09bfc51e55b25e42eabdec7e5eaaefce4794f922fbe8ba6a593c",
+        "9b442e4ba64a5c1e618b3ac92872757cfd97b4dd7aa0e944fba45133c673f7de"
+      ],
+      "hints": [
+        "Successful logons are Security event 4624. A Remote Desktop logon has LogonType 10.",
+        "Keep only the records whose IpAddress is 194.61.24.102 and whose LogonType is 10, and sort them by time.",
+        "The answer is the TargetLogonId of the earliest one. It looks like `0x` followed by six characters."
+      ],
+      "success": "Correct: record 7495. A logon ID names one session, and every later event from that session carries it."
+    },
+    {
+      "id": 5,
+      "title": "The session that moved on",
+      "question": "DC01 Security 4648 records that target the server DESKTOP-SDN1RPT: what is their SubjectLogonId?",
+      "normalize": "casefold",
+      "pattern": null,
+      "then": null,
+      "salt": "5add33d611dac24c11542f17edc818c2",
+      "hash": "c6ccb6782bb92a0779f7807e40ecbebe7eeb9467721d1d1b4e9df4ba54b2487c",
+      "alternates": [
+        "c95b5c4f7321f121a6c65d2d505e499a7686c9920508c25f3f886b9baf357f64",
+        "23080be376c7e7a6f6135dcac0093760bb6cdc19bacf4c53975252e01046af5f"
+      ],
+      "hints": [
+        "Event 4648 means someone used explicit credentials to reach another machine. It is logged on the machine they were sitting at.",
+        "Find the DC01 Security 4648 records whose TargetServerName is DESKTOP-SDN1RPT.",
+        "The answer is their SubjectLogonId. Compare it with your answer to checkpoint 4."
+      ],
+      "success": "Correct. It is not the session from checkpoint 4. The attacker logged on several times, and this later session is the one that reached the desktop."
+    },
+    {
+      "id": 6,
+      "title": "The implant's file record",
+      "question": "What is the file-table (MFT) record number of `Windows\\System32\\coreupdater.exe` in the image?",
+      "normalize": "integer",
+      "pattern": null,
+      "then": null,
+      "salt": "7a4717c2b835b7a5e4ea58c4f2a1d5fb",
+      "hash": "670d409504763fd959b50eddde1992b6d57efb5ce387f127b673189973110fd0",
+      "alternates": [],
+      "hints": [
+        "Every file on NTFS has a numbered record in the master file table.",
+        "Sleuth Kit's `ifind -n <path>` gives the record number for a path. It needs the partition offset from checkpoint 1.",
+        "Run `ifind` with `-o 718848` and `-n /Windows/System32/coreupdater.exe` on the E01 file."
+      ],
+      "success": "Correct. That number is how you cite this file. Check the name carefully: it ends in \"r\"."
+    },
+    {
+      "id": 7,
+      "title": "Moved or copied?",
+      "question": "In the NTFS change journal, what is the USN of the record that renamed `coreupdater.exe` into the System32 folder?",
+      "normalize": "integer",
+      "pattern": null,
+      "then": null,
+      "salt": "0925f667787957f7e0349d5317bf9715",
+      "hash": "d2eab06505351457458d6fc90a153049a27e87fc0bb2bd84514a34a497f35c59",
+      "alternates": [],
+      "hints": [
+        "NTFS logs file changes in a journal at `$Extend/$UsnJrnl:$J`. MFTECmd turns it into a CSV.",
+        "Filter the journal for the name `coreupdater.exe` and look for records whose reason includes RenameNewName. Look at their parent folder.",
+        "There are two such renames. You want the one whose parent is the System32 folder, not Downloads. The answer is its update sequence number."
+      ],
+      "success": "Correct. The file kept the same record number, 87137, before and after. It was moved from Downloads, not copied."
+    },
+    {
+      "id": 8,
+      "title": "The service",
+      "question": "What is the EventRecordID of the DC01 System 7045 event that installed the service named `coreupdater`?",
+      "normalize": "integer",
+      "pattern": null,
+      "then": null,
+      "salt": "068393fb1781579caf1038d41023b631",
+      "hash": "4dee0fc5daa73afac5f14e78ad26ed7e4c43ead24859455e6867a5be44925112",
+      "alternates": [],
+      "hints": [
+        "Windows writes System event 7045 when a new service is installed.",
+        "Filter the DC01 CSV for event ID 7045 in the System channel and the service name `coreupdater`.",
+        "The answer is the record number of that event, not the event ID."
+      ],
+      "success": "Correct. Now compare this event's time with the last-write time of the service's registry key in the image. They are identical, which ties the log to the disk."
+    },
+    {
+      "id": 9,
+      "title": "Did it run?",
+      "question": "What run count does the Administrator's UserAssist record show for `coreupdater.exe`?",
+      "normalize": "integer",
+      "pattern": null,
+      "then": null,
+      "salt": "d57d9cf444209a99981462f53cd22786",
+      "hash": "d1161d948fef503511dc86030d64e0f6e5119e88a40aadd08ccde23cb0d482a0",
+      "alternates": [],
+      "hints": [
+        "UserAssist lives in a user's `NTUSER.DAT` registry hive and counts programs started through the desktop.",
+        "Run RegRipper's `userassist` plugin on the Administrator's `NTUSER.DAT` in the mounted image.",
+        "Find the line for `coreupdater.exe`. The run count is the number in parentheses."
+      ],
+      "success": "Correct. This is thin evidence: this server has no Prefetch, and the implant is missing from the other usual execution records. Say what the record shows, not more."
+    },
+    {
+      "id": 10,
+      "title": "The Recycle Bin",
+      "question": "What is the name of the Recycle Bin index file (the `$I` file) on the image? Include the `$` and the extension.",
+      "normalize": "casefold",
+      "pattern": null,
+      "then": null,
+      "salt": "409cea0f76501f2ac06235bee1d0a29c",
+      "hash": "e4e0e6bce0bc1982e83f20d4c4019f9f4e93c780ed7e54daaa95f15af9b6621a",
+      "alternates": [
+        "b6612e5155d7965aa5e4cb1bb2ca6cf448520328da8d358cf5032fab4f0a2466"
+      ],
+      "hints": [
+        "The Recycle Bin is the hidden folder `$Recycle.Bin` at the top of the volume, with one subfolder per user.",
+        "Each deleted item is a pair: a `$I` file holding the original path, size, and deletion time, and a `$R` file holding the content.",
+        "List the contents of the subfolders of `$Recycle.Bin` on the mounted image. RBCmd decodes the `$I` file."
+      ],
+      "success": "Correct. Decode it: it tells you which file was deleted, from where, and when."
+    },
+    {
+      "id": 11,
+      "title": "The changed timestamps",
+      "question": "For `Beth_Secret.txt`, how many seconds passed between the journal record that created it and the later journal record that changed its basic information? Round down to a whole number.",
+      "normalize": "integer",
+      "pattern": null,
+      "then": null,
+      "salt": "9380c094d3f0f0b92e6de6d27b8bdbcb",
+      "hash": "034339b6d93d6077a1c24dd644e19dbdf7a1d617cf8e7d69f8259f5ac5bc6436",
+      "alternates": [],
+      "hints": [
+        "Use the change journal CSV from checkpoint 7 and filter for `Beth_Secret.txt`. Note its EntryNumber and SequenceNumber.",
+        "List every journal record with that EntryNumber and SequenceNumber, whatever its name. Find the FileCreate record, and the later record whose reason is BasicInfoChange. That reason covers timestamp changes.",
+        "Subtract the first time from the second, in seconds, and round down."
+      ],
+      "success": "Correct. Now compare the file's two sets of timestamps in its MFT record. One set was changed after the fact and the other was not."
+    },
+    {
+      "id": 12,
+      "title": "The clock",
+      "question": "Using the network sensor summary and the logs, how many hours ahead of the sensor is the machines' clock? Round to the nearest whole hour.",
+      "normalize": "integer",
+      "pattern": null,
+      "then": null,
+      "salt": "5bd86f0d017f84000e0492b90524fd78",
+      "hash": "159a8c36eadf36829dd8647c7cde09c4b38a0891d1ea54eb68923d9984e41fc1",
+      "alternates": [
+        "159a8c36eadf36829dd8647c7cde09c4b38a0891d1ea54eb68923d9984e41fc1"
+      ],
+      "hints": [
+        "`derived/NETWORK/rdp-sensor-summary.txt` gives times from the network sensor, whose clock is correct.",
+        "Find one event that both sources recorded, for example the single Remote Desktop connection from 10.42.85.10 to 10.42.85.115.",
+        "Subtract the sensor's time from the log's time for that event and round to the nearest hour."
+      ],
+      "success": "Correct. Every time on this server, in the logs and on the disk, is one hour ahead. Correct your timeline before you compare it with anything else."
     }
   ]
 }

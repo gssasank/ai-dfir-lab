@@ -27,9 +27,21 @@ checkpoints = checkpoints.json
 tools_file = tools.list
 replay_dir = fallback
 ticket = ticket.md
+ai_report = ai-report.md
 ; The worksheet is a document students fill in outside the VM.
 worksheet =
 worksheet_template =
+
+[disk]
+; The domain controller's disk image, unpacked by the setup script. It holds
+; live malware: it is only ever mounted read-only and noexec.
+image = /cases/@CASE_ID@/disk/@IMAGE_SHORT_NAME@.E01
+segments = @IMAGE_FILES@
+mount_point = @IMAGE_MOUNT_POINT@
+ewf_mount = /mnt/ewf_@IMAGE_SHORT_NAME_LOWER@
+probe = Windows/System32/config/SYSTEM
+probe_magic = regf
+zip_name = @IMAGE_ZIP_NAME@
 
 [requirements]
 ; The SIFT OVA gives the VM 4096 MB, of which the guest sees about 3.8 GiB.

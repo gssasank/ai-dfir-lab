@@ -21,6 +21,7 @@ Windows); the result depends only on the repository contents and zlib.
 
 import argparse
 import base64
+import fnmatch
 import gzip
 import hashlib
 import io
@@ -46,15 +47,21 @@ MARKER = "__DFIR_LAB_PAYLOAD_BELOW__"
 REQUIRED_KEYS = ("REPO_OWNER", "REPO_NAME", "VERSION", "CLAUDE_CODE_VERSION",
                  "PROTOCOL_SIFT_REPO", "PROTOCOL_SIFT_COMMIT", "GATEWAY_BASE_URL",
                  "MODEL_MAIN", "MODEL_SMALL", "CASE_ID", "CASE_TITLE", "CASE_KIT_PATTERN",
-                 "CASE_KIT_SHA256")
+                 "CASE_KIT_SHA256", "CASE_KIT_REPO_PATH", "IMAGE_ZIP_PATTERN", "IMAGE_ZIP_NAME", "IMAGE_ZIP_SIZE",
+                 "IMAGE_ZIP_SHA256", "IMAGE_ZIP_DIR", "IMAGE_FILES", "IMAGE_UNPACKED_BYTES",
+                 "IMAGE_SHORT_NAME", "IMAGE_MOUNT_POINT")
 VALUE_RE = re.compile(r"^[A-Za-z0-9._:/@+* -]*$")
+README = REPO / "README.md"
+README_BEGIN = "<!-- BEGIN STUDENT COMMAND -->"
+README_END = "<!-- END STUDENT COMMAND -->"
 
 # Toolkit files the VM needs. Tests and the instructor tools stay behind.
 LAB_FILES = ["install.sh", "bin/dfir-lab", "bin/dfir-lab-configure-claude",
-             "etc/lab.conf.example", "libexec/key-helper", "libexec/pretool-guard"]
+             "etc/lab.conf.example", "libexec/key-helper", "libexec/pretool-guard",
+             "libexec/disk-mount"]
 LAB_TREES = ["lib/dfir_lab", "share"]
 EXECUTABLE = {"lab/install.sh", "lab/bin/dfir-lab", "lab/bin/dfir-lab-configure-claude",
-              "lab/libexec/key-helper", "lab/libexec/pretool-guard",
+              "lab/libexec/key-helper", "lab/libexec/pretool-guard", "lab/libexec/disk-mount",
               "lab/share/readiness-sample/readiness.sh"}
 
 KIT_REQUIRED = ("evidence/", "derived/", "README.md", "MANIFEST.sha256", "tools.list")
@@ -97,6 +104,16 @@ def read_release(path):
         ("REPO_OWNER", r"^[A-Za-z0-9-]+$"),
         ("MODEL_MAIN", r"^[A-Za-z0-9._:/@-]+$"),
         ("MODEL_SMALL", r"^[A-Za-z0-9._:/@-]+$"),
+        ("CASE_KIT_REPO_PATH", r"^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*\.zip$"),
+        ("IMAGE_ZIP_PATTERN", r"^[A-Za-z0-9._*-]+\.zip$"),
+        ("IMAGE_ZIP_NAME", r"^[A-Za-z0-9._-]+\.zip$"),
+        ("IMAGE_ZIP_SIZE", r"^[1-9][0-9]*$"),
+        ("IMAGE_ZIP_SHA256", r"^[0-9a-f]{64}$"),
+        ("IMAGE_ZIP_DIR", r"^[A-Za-z0-9._-]+$"),
+        ("IMAGE_FILES", r"^[A-Za-z0-9._-]+:[0-9a-f]{64}( [A-Za-z0-9._-]+:[0-9a-f]{64})*$"),
+        ("IMAGE_UNPACKED_BYTES", r"^[1-9][0-9]*$"),
+        ("IMAGE_SHORT_NAME", r"^[A-Za-z0-9_-]+$"),
+        ("IMAGE_MOUNT_POINT", r"^/mnt/[a-z0-9_-]+$"),
     ]
     for key, rx in checks:
         if not re.match(rx, values[key]):
@@ -117,7 +134,28 @@ def read_release(path):
     vparts = tuple(int(x) for x in values["CLAUDE_CODE_VERSION"].split("."))
     if vparts < (2, 1, 295):
         raise BuildError("release.conf: the toolkit needs Claude Code 2.1.295 or later")
+    names = [f.split(":")[0] for f in values["IMAGE_FILES"].split()]
+    short = values["IMAGE_SHORT_NAME"]
+    for ext in (".E01", ".E02"):
+        if not any(n.endswith(ext) for n in names):
+            raise BuildError("release.conf: IMAGE_FILES must contain the %s segment" % ext)
+    if any(n.startswith(short + ".") for n in names):
+        raise BuildError("release.conf: IMAGE_SHORT_NAME %r clashes with a file in IMAGE_FILES"
+                         % short)
+    values["IMAGE_SHORT_NAME_LOWER"] = short.lower()
+    kit_name = values["CASE_KIT_REPO_PATH"].rsplit("/", 1)[-1]
+    if not fnmatch.fnmatchcase(kit_name, values["CASE_KIT_PATTERN"]):
+        raise BuildError("release.conf: CASE_KIT_REPO_PATH %r does not match CASE_KIT_PATTERN %r"
+                         % (kit_name, values["CASE_KIT_PATTERN"]))
+    # Same owner, repository and tag as the student command: the script and the
+    # kit always come from the same release.
+    values["CASE_KIT_URL"] = "%s/%s" % (release_base_url(values), values["CASE_KIT_REPO_PATH"])
     return values
+
+
+def release_base_url(rel):
+    return "https://raw.githubusercontent.com/%s/%s/v%s" % (rel["REPO_OWNER"], rel["REPO_NAME"],
+                                                          rel["VERSION"])
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +192,8 @@ def payload_members(rel):
 
     tpl = (HERE / "lab.conf.in").read_text(encoding="utf-8")
     for key in ("VERSION", "GATEWAY_BASE_URL", "MODEL_MAIN", "MODEL_SMALL", "CLAUDE_EFFORT",
-                "CASE_ID", "CASE_TITLE"):
+                "CASE_ID", "CASE_TITLE", "IMAGE_SHORT_NAME_LOWER", "IMAGE_SHORT_NAME",
+                "IMAGE_FILES", "IMAGE_MOUNT_POINT", "IMAGE_ZIP_NAME"):
         tpl = tpl.replace("@%s@" % key, rel[key])
     left = sorted(set(re.findall(r"@[A-Z_]+@", tpl)) - {"@CLAUDE_BINARY@"})
     if left:
@@ -224,6 +263,16 @@ def render_script(rel, payload_gz):
         "R_CASE_TITLE='%s'" % rel["CASE_TITLE"],
         "R_CASE_KIT_PATTERN='%s'" % rel["CASE_KIT_PATTERN"],
         "R_CASE_KIT_SHA256='%s'" % " ".join(rel["CASE_KIT_SHA256"].split()),
+        "R_CASE_KIT_URL='%s'" % rel["CASE_KIT_URL"],
+        "R_IMAGE_ZIP_PATTERN='%s'" % rel["IMAGE_ZIP_PATTERN"],
+        "R_IMAGE_ZIP_NAME='%s'" % rel["IMAGE_ZIP_NAME"],
+        "R_IMAGE_ZIP_SIZE='%s'" % rel["IMAGE_ZIP_SIZE"],
+        "R_IMAGE_ZIP_SHA256='%s'" % rel["IMAGE_ZIP_SHA256"],
+        "R_IMAGE_ZIP_DIR='%s'" % rel["IMAGE_ZIP_DIR"],
+        "R_IMAGE_FILES='%s'" % rel["IMAGE_FILES"],
+        "R_IMAGE_UNPACKED_BYTES='%s'" % rel["IMAGE_UNPACKED_BYTES"],
+        "R_IMAGE_SHORT_NAME='%s'" % rel["IMAGE_SHORT_NAME"],
+        "R_IMAGE_MOUNT_POINT='%s'" % rel["IMAGE_MOUNT_POINT"],
         "R_PAYLOAD_SHA256='%s'" % hashlib.sha256(payload_gz).hexdigest(),
     ]
     if tpl.count("@@RELEASE_SETTINGS@@") != 1:
@@ -238,8 +287,17 @@ def render_script(rel, payload_gz):
     return (script + MARKER + "\n" + "\n".join(lines) + "\n").encode("ascii")
 
 
-def build(out_dir):
+def build(out_dir, test_kit_hashes=()):
     rel = read_release(HERE / "release.conf")
+    if test_kit_hashes:
+        # A test build also accepts extra kit hashes (the stand-in kit for the mock
+        # VM test). It must never land in dist/.
+        if Path(out_dir).resolve() == DIST.resolve():
+            raise BuildError("a test build (--test-kit-sha256) cannot be written to dist/")
+        for h in test_kit_hashes:
+            if not re.match(r"^[0-9a-f]{64}$", h):
+                raise BuildError("--test-kit-sha256 needs a SHA-256 value, got %r" % h)
+        rel = dict(rel, CASE_KIT_SHA256=" ".join([rel["CASE_KIT_SHA256"]] + list(test_kit_hashes)))
     payload = build_tar_gz(payload_members(rel))
     data = render_script(rel, payload)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -253,8 +311,7 @@ def build(out_dir):
 
 def student_command(rel, digest, base_url=None):
     if base_url is None:
-        base_url = "https://raw.githubusercontent.com/%s/%s/v%s" % (
-            rel["REPO_OWNER"], rel["REPO_NAME"], rel["VERSION"])
+        base_url = release_base_url(rel)
     return ('curl -fsSLO %s/dist/bootstrap.sh && echo "%s  bootstrap.sh" | sha256sum -c '
             '&& bash bootstrap.sh' % (base_url.rstrip("/"), digest))
 
@@ -325,6 +382,9 @@ def main(argv=None):
                                   "the stand-in kit)")
     ap.add_argument("--base-url", help="print the student command for this base URL "
                                        "instead of raw.githubusercontent.com (testing)")
+    ap.add_argument("--test-kit-sha256", action="append", default=[], metavar="HASH",
+                    help="TEST BUILD: also accept this kit hash (the stand-in kit); needs --out "
+                         "outside dist/ and never touches README.md")
     args = ap.parse_args(argv)
     try:
         if args.what == "standin-kit":
@@ -338,23 +398,35 @@ def main(argv=None):
             print("SHA-256:      %s" % digest)
             print("Accepted by release.conf: %s" % (
                 "yes" if digest in read_release_loose().split() else
-                "NO - put this hash in CASE_KIT_SHA256"))
+                "no (tests: build.py --test-kit-sha256 %s --out <folder>)" % digest))
             return 0
+        test = list(args.test_kit_sha256)
+        if test and not args.out:
+            raise BuildError("--test-kit-sha256 needs --out <folder outside dist/>")
         if args.check:
-            a = build(Path(tempfile.mkdtemp(prefix="dfir-build-a-")))[2]
-            b = build(Path(tempfile.mkdtemp(prefix="dfir-build-b-")))[2]
+            a = build(Path(tempfile.mkdtemp(prefix="dfir-build-a-")), test)[2]
+            b = build(Path(tempfile.mkdtemp(prefix="dfir-build-b-")), test)[2]
             print("build 1: %s\nbuild 2: %s" % (a, b))
             if a != b:
                 raise BuildError("the two builds differ")
             print("Deterministic: yes")
-        rel, out, digest, psize = build(Path(args.out) if args.out else DIST)
+        out_dir = Path(args.out) if args.out else DIST
+        rel, out, digest, psize = build(out_dir, test)
         print("Built %s (%d bytes, payload %d bytes compressed)" % (out, out.stat().st_size,
                                                                      psize))
         print("SHA-256: %s" % digest)
         print("Version %s, Claude Code %s, Protocol SIFT %s, case %s, %d accepted kit hash(es)"
               % (rel["VERSION"], rel["CLAUDE_CODE_VERSION"], rel["PROTOCOL_SIFT_COMMIT"][:12],
                  rel["CASE_ID"], len(rel["CASE_KIT_SHA256"].split())))
-        if args.base_url:
+        if test:
+            print("\nTEST BUILD (also accepts %d test kit hash(es)): NOT FOR STUDENTS, README.md "
+                  "not changed." % len(test))
+        elif out_dir.resolve() == DIST.resolve() and rel["REPO_OWNER"] != PLACEHOLDER_OWNER:
+            changed = write_readme_command(student_command(rel, digest))
+            print("README.md: student command %s" % ("updated" if changed else "already current"))
+        if test:
+            pass
+        elif args.base_url:
             print("\nTest command (NOT for students):\n%s" % student_command(rel, digest,
                                                                            args.base_url))
         elif rel["REPO_OWNER"] == PLACEHOLDER_OWNER:
@@ -368,6 +440,25 @@ def main(argv=None):
     except (BuildError, OSError) as exc:
         print("build.py: %s" % exc, file=sys.stderr)
         return 1
+
+
+def write_readme_command(command, path=README):
+    """Put the student command between the two markers in README.md. Returns
+    True when the file changed. Idempotent: README.md is not part of the
+    payload, so this cannot change the script's hash."""
+    text = path.read_bytes().decode("utf-8")
+    if text.count(README_BEGIN) != 1 or text.count(README_END) != 1 or \
+            text.index(README_BEGIN) > text.index(README_END):
+        raise BuildError("README.md must contain %s and %s once each, in that order"
+                         % (README_BEGIN, README_END))
+    nl = "\r\n" if "\r\n" in text else "\n"
+    head, rest = text.split(README_BEGIN, 1)
+    _, tail = rest.split(README_END, 1)
+    new = head + README_BEGIN + nl + "```" + nl + command + nl + "```" + nl + README_END + tail
+    if new == text:
+        return False
+    path.write_bytes(new.encode("utf-8"))
+    return True
 
 
 def read_release_loose():

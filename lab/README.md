@@ -13,6 +13,7 @@ lab/
   lib/dfir_lab/                   one module per command + config, redact, gateway, ui
   libexec/key-helper              Claude Code apiKeyHelper (prints the key only)
   libexec/pretool-guard           Claude Code PreToolUse hook (deters obvious reads of the key)
+  libexec/disk-mount              root helper for dfir-lab mount / unmount (run through sudo)
   etc/lab.conf.example            every setting, with comments
   share/                          desktop shortcuts, Claude settings fragment, readiness sample
   install.sh                      installer / uninstaller
@@ -55,7 +56,8 @@ check 10 stop with exit code 3 and do not run Claude Code. The merge:
 - leaves out features the lab never uses, because the Duke gateway counts
   every token of every request (cached or not) against each key's
   tokens-per-minute limit: the `Workflow`, `ScheduleWakeup`, `ReportFindings`
-  and `ListAgents` tools are denied (a denied tool is not sent at all), and
+  and `ListAgents` tools and the sub-agent tool `Agent` (each sub-agent sends
+  its own full-size requests) are denied (a denied tool is not sent at all), and
   `CLAUDE_CODE_DISABLE_WORKFLOWS`, `_CRON`, `_BUNDLED_SKILLS`, `_ADVISOR_TOOL`,
   `_ARTIFACT` and `_TERMINAL_TITLE` are set to `1`.
 
@@ -64,6 +66,32 @@ check 10 stop with exit code 3 and do not run Claude Code. The merge:
 interactive start goes straight to the prompt. If it cannot, the banner tells
 the student to choose "Yes, I trust this folder". Claude Code older than
 2.1.295 is refused (the guard's `onFailure: "block"` needs it).
+
+## The disk image (`mount`, `unmount`, `mount --status`)
+
+The case's disk image (E01 segments under `/cases/<case>/disk/`, settings in
+`[disk]` of `lab.conf`) is mounted read-only and noexec by
+`libexec/disk-mount`, a root helper run through `sudo` (passwordless on the
+SIFT VM): `ewfmount` -> a read-only loop device over the Windows partition
+(found as the NTFS partition holding `Windows/System32/config/SYSTEM`) ->
+`ntfs-3g -o ro,noexec,nodev,nosuid,show_sys_files,streams_interface=windows`
+at `/mnt/dc01`. It is adapted from the tested `casekit/disk/mount-case.sh`.
+
+- `dfir-lab mount` is idempotent ("already mounted"), refuses to put a second
+  file system on a busy mount point, and confirms the result from the mount
+  table (`/proc/self/mountinfo`: `ro`, `noexec`, `nodev`, `nosuid`; the loop
+  device's read-only flag in `/sys/block`) and by reading the probe file. It
+  never tests safety by writing to or running anything from the image, which
+  holds live malware. Messages never show the partition offset.
+- `dfir-lab mount --status` reads the same tables and needs no `sudo`; exit 0
+  when mounted, 1 otherwise. Reading the mounted files needs no `sudo` either.
+- `dfir-lab unmount` undoes every layer; it says what to close when the mount
+  point is in use. Nothing is mounted after a reboot; `dfir-lab start` mounts
+  the image before it starts Claude Code (if that fails, it asks whether to
+  start anyway; without a terminal it starts anyway).
+- Readiness check 3 also verifies the image: every file in `[disk] segments`
+  present with its SHA-256 (cached in `~/dfir-lab/disk-verified.json` by
+  inode, size, mtime, ctime, owner and mode), mounted, probe file readable.
 
 ## Run the tests
 

@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import casekit, configure_claude, fsutil, keystore, paths, readiness, ui
+from . import casekit, configure_claude, disk, fsutil, keystore, paths, readiness, ui
 from .claude_env import find_claude, process_env, require_min_version
 from .errors import ConfigError, LabError, UsageError
 from .gateway import (Gateway, KeyLimits, classify, model_ids, probe_network, similar_models,
@@ -265,7 +265,57 @@ def check_tools(ctx):
 # 3. Case files
 # --------------------------------------------------------------------------
 
+_RANK = {PASS: 0, SKIP: 0, WARN: 1, FAIL: 2}
+
+
 def check_case(ctx):
+    """Check 3: the case kit and overlay files against the manifest and, when
+    the case has one, the disk image (segment hashes, read-only noexec mount,
+    a known system file readable through it)."""
+    r = _check_kit(ctx)
+    part = disk_part(ctx.cfg)
+    if part is None:
+        return r
+    status, text, todo = part
+    r.data["disk"] = {"status": status, "result": text}
+    r.result = "%s; %s" % (r.result.rstrip("."), text)
+    if _RANK[status] > _RANK[r.status]:
+        r.status = status
+    r.todo = " ".join(t for t in (r.todo, todo) if t)
+    return r
+
+
+def disk_part(cfg):
+    """(status, text, todo) for the case's disk image, or None if it has none."""
+    ds = disk.settings(cfg)
+    if ds is None:
+        return None
+    st = disk.status(ds)
+    if st.missing:
+        return (FAIL, "the disk image is not installed (missing: %s)" % ", ".join(st.missing[:3]),
+                disk.missing_todo(ds))
+    try:
+        bad, writable = disk.verify_segments(ds)
+    except OSError as exc:
+        return (FAIL, "the disk image could not be read (%s)" % (exc.strerror or exc),
+                "Run the lab setup command again; if that does not help, tell the TA.")
+    if bad:
+        return (FAIL, "the disk image does not match its expected SHA-256 (%s)" % ", ".join(bad),
+                "The disk image on this VM is damaged. Download %s again from the course site "
+                "into ~/Downloads and run the lab setup command again." % ds.zip_name)
+    try:
+        disk.mount(ds, quiet=True)
+    except LabError as exc:
+        return FAIL, "the disk image could not be mounted: %s" % exc.what, exc.todo or ""
+    text = ("disk image: %d files match their SHA-256, mounted read-only and noexec at %s, "
+            "%s readable" % (len(ds.segments), ds.mount_point, ds.probe))
+    if writable:
+        return (WARN, text + ", but your account can change %s" % ", ".join(writable),
+                "Nothing breaks now, but tell the TA so the setup can be fixed.")
+    return PASS, text, ""
+
+
+def _check_kit(ctx):
     cfg = ctx.cfg
     case_dir = cfg.case_dir
     if not case_dir.is_dir():

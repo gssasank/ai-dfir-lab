@@ -1,6 +1,0 @@
-{"type": "prompt", "text": "PLACEHOLDER recording. Look at the security events. Did anyone log on remotely?"}
-{"type": "assistant_text", "text": "This is a placeholder replay for the stand-in evidence. The real recordings for this case are not made yet."}
-{"type": "tool_call", "tool": "Bash", "command": "grep -E ',(4624|4625),' evidence/security-events.csv", "args": {"command": "grep -E ',(4624|4625),' evidence/security-events.csv"}}
-{"type": "tool_result", "output": "1001,2020-09-19 03:10:02,4624,svc_backup,10.42.85.20,3\n1002,2020-09-19 03:21:41,4625,Administrator,203.0.113.77,3\n1003,2020-09-19 03:21:43,4625,Administrator,203.0.113.77,3\n1004,2020-09-19 03:21:44,4625,Administrator,203.0.113.77,3\n1005,2020-09-19 03:21:46,4624,Administrator,203.0.113.77,10", "truncated": false, "note": ""}
-{"type": "pause", "question": "PLACEHOLDER: which record would you open first to verify a remote logon?"}
-{"type": "assistant_text", "text": "Three failed logons from 203.0.113.77 are followed by a successful remote logon (record 1005). End of the placeholder recording."}

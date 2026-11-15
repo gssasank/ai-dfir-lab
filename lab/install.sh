@@ -99,10 +99,10 @@ do_install() {
     mkdir -p "$LIB/libexec" "$LIB/share"
     cp -R "$SRC/lib/dfir_lab" "$LIB/dfir_lab"
     find "$LIB/dfir_lab" -name __pycache__ -type d -prune -exec rm -rf {} +
-    cp "$SRC/libexec/key-helper" "$SRC/libexec/pretool-guard" "$LIB/libexec/"
+    cp "$SRC/libexec/key-helper" "$SRC/libexec/pretool-guard" "$SRC/libexec/disk-mount" "$LIB/libexec/"
     cp -R "$SRC/share/claude" "$SRC/share/readiness-sample" "$SRC/share/desktop" "$LIB/share/"
     chmod -R a+rX "$LIB"
-    chmod 755 "$LIB/libexec/key-helper" "$LIB/libexec/pretool-guard"
+    chmod 755 "$LIB/libexec/key-helper" "$LIB/libexec/pretool-guard" "$LIB/libexec/disk-mount"
     say "package and helpers -> $LIB"
 
     for b in $STUDENT_BINS; do

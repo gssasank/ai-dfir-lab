@@ -2,7 +2,7 @@
 
 import os
 
-from . import casekit, configure_claude, fsutil, keystore, paths, setup_key, ui
+from . import casekit, configure_claude, disk, fsutil, keystore, paths, setup_key, ui
 from .claude_env import find_claude, process_env, require_min_version
 from .errors import ConfigError, LabError
 from .gateway import probe_network
@@ -16,9 +16,10 @@ def _reachable(cfg):
     return probe_network(cfg.base_url, timeout)
 
 
-def banner(cfg, trust_note=""):
+def banner(cfg, trust_note="", disk_line=""):
     ws = cfg.case_path("worksheet")
     ticket = cfg.case_path("ticket")
+    report = cfg.case_path("ai_report")
     lines = [
         "=" * 64,
         " %s - DFIR Lab" % cfg.course,
@@ -27,9 +28,15 @@ def banner(cfg, trust_note=""):
     ]
     if ticket and ticket.exists():
         lines.append(" Incident ticket: %s" % ticket)
+    if report and report.exists():
+        lines.append(" AI report to check (worksheet Section C): %s" % report)
+    if disk_line:
+        lines.append(disk_line)
     if ws:
         lines.append(" Worksheet: %s" % ws)
     lines += [
+        " Type /clear in Claude Code before you start each new checkpoint:",
+        "   short conversations are fast; long ones get slow.",
         " Save your work in analysis/ and reports/ inside the case folder.",
         " Check a checkpoint answer (in another terminal):  dfir-lab checkpoint 1 <answer>",
         " Get a hint:  dfir-lab hint 1      See progress:  dfir-lab progress",
@@ -40,6 +47,30 @@ def banner(cfg, trust_note=""):
         lines.append(trust_note)
     lines.append("=" * 64)
     return "\n".join(lines)
+
+
+def mount_disk(cfg):
+    """Mount the case's disk image if it is not mounted. Returns the banner
+    line. If mounting fails the student may still start Claude Code: the
+    log-based checkpoints do not need the image."""
+    ds = disk.settings(cfg)
+    if ds is None:
+        return ""
+    try:
+        disk.mount(ds)
+        return " Disk image: mounted read-only at %s" % ds.mount_point
+    except LabError as exc:
+        ui.problem(exc.what, exc.todo)
+        fsutil.log("start.mount-failed", what=exc.what)
+        try:
+            go = ui.ask_yes_no("Start Claude Code anyway? Checkpoints that use the disk image "
+                               "will not work until it is mounted.", default=True,
+                               title="Start DFIR Lab")
+        except LabError:      # no terminal and no window to ask in
+            go = True
+        if not go:
+            raise LabError("Start was cancelled.", "Run  dfir-lab mount , then  dfir-lab start .")
+        return " Disk image: NOT MOUNTED (run  dfir-lab mount  in another terminal)"
 
 
 def run(cfg, passthrough=None, replay_fn=None):
@@ -101,8 +132,12 @@ def run(cfg, passthrough=None, replay_fn=None):
         " If Claude Code asks whether you trust this folder, choose "
         "\"Yes, I trust this folder\" and press Enter.")
 
+    # The disk image: mounted read-only before Claude Code starts (nothing is
+    # mounted after a restart of the VM).
+    disk_line = mount_disk(cfg)
+
     # 4. Banner.
-    ui.out(banner(cfg, note))
+    ui.out(banner(cfg, note, disk_line))
 
     # 6. Session log (before exec, which does not return).
     fsutil.append_line(paths.sessions_log(), "%s lab=%s case=%s" % (

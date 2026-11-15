@@ -14,7 +14,8 @@ H=$HOME
 paths=(/usr/local/bin/dfir-lab /usr/local/bin/dfir-lab-configure-claude /usr/local/lib/dfir-lab
        /etc/dfir-lab /usr/local/share/applications "/cases/$case_id" "$H/Desktop" "$H/.claude"
        "$H/.claude.json" "$H/.bashrc" "$H/.profile" "$H/.local/bin" "$H/.local/share/claude"
-       "$H/.config/dfir-lab" "$H/.config/mimeapps.list")
+       "$H/.config/dfir-lab" "$H/.config/mimeapps.list" "$H/.config/autostart"
+       /etc/update-manager/release-upgrades)
 existing=()
 for p in "${paths[@]}"; do sudo test -e "$p" && existing+=("$p"); done
 sudo find "${existing[@]}" -printf '%y %u:%g %m %s %p\n' 2>/dev/null | LC_ALL=C sort -k5 |
@@ -37,3 +38,5 @@ printf 'gsettings ubuntu-lock-on-suspend %s\n' "$(gsettings get org.gnome.deskto
 printf 'browser %s\n' "$(xdg-settings get default-web-browser 2>&1)"
 printf 'mime https %s\n' "$(xdg-mime query default x-scheme-handler/https 2>&1)"
 dpkg-query -W -f='package ${Package} ${Version} ${Status}\n' open-vm-tools-desktop zenity 2>&1
+printf 'mount dc01 %s\n' "$(findmnt -rn -o SOURCE,FSTYPE,VFS-OPTIONS --mountpoint /mnt/dc01 2>&1 | tr '\n' ';')"
+printf 'release-upgrades %s\n' "$(grep '^Prompt=' /etc/update-manager/release-upgrades 2>&1)"
