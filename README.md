@@ -26,7 +26,8 @@ Follow this page before class to turn a SANS SIFT Workstation virtual machine (V
 5. Download the disk image `DC01-E01.zip` (4.84 GB) from https://canvas.duke.edu/courses/82519/files/5803259 into the Downloads folder. This is the only file you download: the setup command fetches everything else.
    Download the disk image inside the VM, not on your own computer: it is evidence from a real intrusion and contains malware.
 6. Open a terminal in the VM and run the setup command below. Wait until it prints `SETUP COMPLETE`. When it asks whether to delete `DC01-E01.zip` to free space, you can answer `y`: the lab uses the unpacked copy.
-7. Double-click "Set up Duke AI access" on the VM desktop and paste your key.
+7. If you are off campus, connect the Duke VPN on your own computer now. Then double-click "Set up Duke AI access" on the VM desktop and paste your key.
+   Copy and paste from your own computer into the VM starts working after you restart the VM once after setup. If you would rather not restart, open https://dashboard.ai.duke.edu in Chromium inside the VM and create and copy your key there.
 8. Double-click "Check my setup". When it says `READY`, your setup is done. Do this before class.
 9. On lab day: if you are off campus, connect the Duke VPN on your own computer. Then start the VM and double-click "Start DFIR Lab".
 
