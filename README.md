@@ -26,7 +26,7 @@ Follow this page before class to turn a SANS SIFT Workstation virtual machine (V
    Download the disk image inside the VM, not on your own computer: it is evidence from a real intrusion and contains malware.
 6. Open a terminal in the VM and run the setup command below. Wait until it prints `SETUP COMPLETE`.
 7. Double-click "Set up Duke AI access" on the VM desktop and paste your key.
-8. Double-click "Check my setup". When it says `READY`, copy the `Readiness code` it prints and submit it on Canvas.
+8. Double-click "Check my setup". When it says `READY`, your setup is done. Do this before class.
 9. On lab day: if you are off campus, connect the Duke VPN on your own computer. Then start the VM and double-click "Start DFIR Lab".
 
 ## The setup command
@@ -49,7 +49,7 @@ If copy and paste from your own computer into the VM does not work, open this pa
 
 ## Keep your key safe
 
-Your key is stored only inside the VM. It is not part of the readiness code, the problem report, or anything else you submit.
+Your key is stored only inside the VM. It is not part of the problem report or of anything you submit.
 
 ## Credits
 
